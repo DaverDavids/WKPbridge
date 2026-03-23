@@ -1,6 +1,5 @@
 // WKPbridge.ino
-// ESP32-C3 BLE-to-WiFi bridge + MQTT/HA forwarding + web UI + OTA
-// NimBLE 2.x security callbacks: void + NimBLEDevice::inject*()
+// ESP32-C3 BLE-to-WiFi bridge
 
 #define DEBUG_SERIAL 1
 
@@ -231,10 +230,6 @@ void serviceMQTT() { }
 
 // --------------------------------------------------------------------------
 // BLE client + security callbacks
-//
-// NimBLE 2.x security callbacks are VOID and use inject() instead of return.
-// onPassKeyEntry   -> prompt user, then call NimBLEDevice::injectPassKey()
-// onConfirmPasskey -> prompt user, then call NimBLEDevice::injectConfirmPasskey()
 // --------------------------------------------------------------------------
 class SecurityCB : public NimBLEClientCallbacks {
 public:
@@ -243,27 +238,25 @@ public:
     c->updateConnParams(12,12,0,200);
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
+  // NimBLE 2.x: fires specifically when connect() fails, before returning false
+  void onConnectFail(NimBLEClient *c, int reason) override {
+    addLog("BLE onConnectFail: reason=0x"+String(reason, HEX)+" ("+String(reason)+") lastErr=0x"+String(c->getLastError(), HEX));
+  }
   void onDisconnect(NimBLEClient *c, int reason) override {
     (void)c; writeChr=nullptr; notifyChr=nullptr;
-    addLog("BLE disconnected reason="+String(reason));
+    addLog("BLE onDisconnect: reason=0x"+String(reason, HEX));
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
-  // NimBLE 2.x: void, no return — send passkey via inject
   void onPassKeyEntry(NimBLEConnInfo &connInfo) override {
-    addLog("BLE pairing: passkey entry requested, injecting 000000");
+    addLog("BLE pairing: passkey entry, injecting 000000");
     NimBLEDevice::injectPassKey(connInfo, 000000);
   }
-  // NimBLE 2.x: void, no return — confirm via inject
   void onConfirmPasskey(NimBLEConnInfo &connInfo, uint32_t pin) override {
-    addLog("BLE pairing: confirm passkey="+String(pin)+" -> YES");
+    addLog("BLE pairing: confirm pin="+String(pin)+" -> YES");
     NimBLEDevice::injectConfirmPasskey(connInfo, true);
   }
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
-    if(connInfo.isEncrypted()){
-      addLog("BLE pairing SUCCESS: bonded="+String(connInfo.isBonded()));
-    } else {
-      addLog("BLE pairing: link not encrypted (Just Works or not required)");
-    }
+    addLog("BLE auth complete: encrypted="+String(connInfo.isEncrypted())+" bonded="+String(connInfo.isBonded()));
   }
 };
 SecurityCB gClientCB;
@@ -352,20 +345,21 @@ bool connectBle() {
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
 
-  addLog("Connecting to "+String(found->getAddress().toString().c_str()));
+  addLog("Connecting to "+String(found->getAddress().toString().c_str())
+         +" addrType="+String(found->getAddress().getType()));
   bleClient=NimBLEDevice::createClient();
   bleClient->setClientCallbacks(&gClientCB, false);
   bleClient->setConnectionParams(12,12,0,200);
   bleClient->setConnectTimeout(15);
 
   if(!bleClient->connect(found)){
-    addLog("connect() failed");
+    addLog("connect() failed lastErr=0x"+String(bleClient->getLastError(), HEX));
     deleteBleClient(); esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
   addLog("Link up, securing...");
 
   if(!bleClient->secureConnection()){
-    addLog("WARNING: secureConnection() failed - trying GATT anyway");
+    addLog("secureConnection() failed lastErr=0x"+String(bleClient->getLastError(), HEX)+" - trying GATT anyway");
   }
 
   addLog("Discovering services...");
@@ -491,9 +485,9 @@ void handleSaveWifi(){
 void handleClearBonds(){
   NimBLEDevice::deleteAllBonds();
   addLog("All BLE bonds cleared");
-  sendOk("Bonds cleared — reconnect to re-pair");
+  sendOk("Bonds cleared");
 }
-void handleConnect()   { connectBle()  ?sendOk("BLE connected"):sendErr("Failed — check log"); }
+void handleConnect()   { connectBle()  ?sendOk("BLE connected"):sendErr("Failed - check log"); }
 void handleDisconnect(){ disconnectBle(); sendOk("Disconnected"); }
 void handleSendFF()    { sendPacket(PKT_FF,sizeof(PKT_FF),"FF")?sendOk("FF sent"):sendErr("FF failed"); }
 void handleSendFE()    { sendPacket(PKT_FE,sizeof(PKT_FE),"FE")?sendOk("FE sent"):sendErr("FE failed"); }
@@ -555,10 +549,7 @@ void setup(){
   beginWiFi(false);
 
   NimBLEDevice::init("");
-  // NimBLE 2.x: setPower takes dBm as int8_t, not ESP_PWR_LVL_* enum
-  NimBLEDevice::setPower(9);  // +9 dBm
-
-  // Enable bonding + MITM + Secure Connections, Just Works IO cap (no PIN prompt)
+  NimBLEDevice::setPower(9);
   NimBLEDevice::setSecurityAuth(true, true, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
