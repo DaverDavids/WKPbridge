@@ -1,6 +1,6 @@
 // WKPbridge.ino
 // ESP32-C3 BLE-to-WiFi bridge + MQTT/HA forwarding + web UI + OTA
-// Wyze Lock requires BLE pairing/bonding. Enable NimBLE security manager.
+// NimBLE 2.x security callbacks: void + NimBLEDevice::inject*()
 
 #define DEBUG_SERIAL 1
 
@@ -230,16 +230,16 @@ void mqttPublish(const String &payload) {
 void serviceMQTT() { }
 
 // --------------------------------------------------------------------------
-// BLE Security callbacks
-// The Wyze Lock almost certainly requires Just Works or passkey pairing.
-// onConfirmPin: auto-confirm numeric comparison (Just Works).
-// onAuthenticationComplete: log the result so we know what happened.
+// BLE client + security callbacks
+//
+// NimBLE 2.x security callbacks are VOID and use inject() instead of return.
+// onPassKeyEntry   -> prompt user, then call NimBLEDevice::injectPassKey()
+// onConfirmPasskey -> prompt user, then call NimBLEDevice::injectConfirmPasskey()
 // --------------------------------------------------------------------------
 class SecurityCB : public NimBLEClientCallbacks {
 public:
   void onConnect(NimBLEClient *c) override {
     addLog("BLE onConnect: "+String(c->getPeerAddress().toString().c_str()));
-    // Request connection parameter update for faster throughput
     c->updateConnParams(12,12,0,200);
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
@@ -248,21 +248,21 @@ public:
     addLog("BLE disconnected reason="+String(reason));
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
-  // Called when a passkey is needed for pairing
-  uint32_t onPassKeyEntry() override {
-    addLog("BLE pairing: passkey requested (using 000000)");
-    return 000000;  // most locks use 000000 or 123456
+  // NimBLE 2.x: void, no return — send passkey via inject
+  void onPassKeyEntry(NimBLEConnInfo &connInfo) override {
+    addLog("BLE pairing: passkey entry requested, injecting 000000");
+    NimBLEDevice::injectPassKey(connInfo, 000000);
   }
-  // Called for numeric comparison (Just Works)
-  bool onConfirmPin(uint32_t pin) override {
-    addLog("BLE pairing: confirm pin="+String(pin)+" -> YES");
-    return true;
+  // NimBLE 2.x: void, no return — confirm via inject
+  void onConfirmPasskey(NimBLEConnInfo &connInfo, uint32_t pin) override {
+    addLog("BLE pairing: confirm passkey="+String(pin)+" -> YES");
+    NimBLEDevice::injectConfirmPasskey(connInfo, true);
   }
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
     if(connInfo.isEncrypted()){
-      addLog("BLE pairing SUCCESS: encrypted="+String(connInfo.isEncrypted())+" bonded="+String(connInfo.isBonded()));
+      addLog("BLE pairing SUCCESS: bonded="+String(connInfo.isBonded()));
     } else {
-      addLog("BLE pairing FAILED or not required (unencrypted link)");
+      addLog("BLE pairing: link not encrypted (Just Works or not required)");
     }
   }
 };
@@ -356,21 +356,16 @@ bool connectBle() {
   bleClient=NimBLEDevice::createClient();
   bleClient->setClientCallbacks(&gClientCB, false);
   bleClient->setConnectionParams(12,12,0,200);
-  bleClient->setConnectTimeout(15);  // seconds
+  bleClient->setConnectTimeout(15);
 
   if(!bleClient->connect(found)){
-    // Log the disconnect reason from the client info
     addLog("connect() failed");
     deleteBleClient(); esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
-  addLog("TCP link up");
+  addLog("Link up, securing...");
 
-  // Wyze Lock may require encryption/authentication before GATT operations
-  // secureConnection() will initiate pairing if needed
-  addLog("Securing connection (pairing if needed)...");
   if(!bleClient->secureConnection()){
     addLog("WARNING: secureConnection() failed - trying GATT anyway");
-    // Don't abort - some devices allow unencrypted GATT for discovery
   }
 
   addLog("Discovering services...");
@@ -493,7 +488,6 @@ void handleSaveWifi(){
   settings.wifiSsid=server.arg("ssid"); settings.wifiPsk=server.arg("psk");
   saveSettings(); beginWiFi(portalMode); sendOk("WiFi saved");
 }
-// Clear all stored BLE bonds so the lock treats us as a new device
 void handleClearBonds(){
   NimBLEDevice::deleteAllBonds();
   addLog("All BLE bonds cleared");
@@ -561,13 +555,12 @@ void setup(){
   beginWiFi(false);
 
   NimBLEDevice::init("");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  // NimBLE 2.x: setPower takes dBm as int8_t, not ESP_PWR_LVL_* enum
+  NimBLEDevice::setPower(9);  // +9 dBm
 
-  // Enable security manager for pairing/bonding
-  // IO capability: NoInputNoOutput = Just Works pairing (no PIN needed)
-  // If the lock requires a PIN, change to KeyboardOnly or DisplayYesNo
-  NimBLEDevice::setSecurityAuth(true, true, true);  // bonding, MITM, SC
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);  // Just Works
+  // Enable bonding + MITM + Secure Connections, Just Works IO cap (no PIN prompt)
+  NimBLEDevice::setSecurityAuth(true, true, true);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   addLog("NimBLE init done, security enabled");
