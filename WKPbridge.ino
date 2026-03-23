@@ -43,8 +43,8 @@ struct Settings {
   String  writeUuid;
   String  notifyUuid;
   bool    autoConnect       = false;
-  bool    writeWithResponse = true;
-  uint8_t scanSeconds       = 4;
+  bool    writeWithResponse = false;  // NUS RX supports WRITE NO RESPONSE
+  uint8_t scanSeconds       = 5;
 };
 
 Preferences prefs;
@@ -52,22 +52,22 @@ WebServer   server(80);
 DNSServer   dns;
 Settings    settings;
 
-bool portalMode      = false;
+bool portalMode       = false;
 bool wifiWasConnected = false;
-bool otaReady        = false;
-bool mdnsReady       = false;
+bool otaReady         = false;
+bool mdnsReady        = false;
 
 unsigned long lastWifiTryMs = 0;
 unsigned long lastBleTryMs  = 0;
 unsigned long lastStateMs   = 0;
 
 String logBuffer;
-String lastScanJson  = "[]";
+String lastScanJson = "[]";
 String lastTxHex;
 String lastRxHex;
 String currentTargetAddr;
 
-NimBLEClient              *bleClient = nullptr;
+NimBLEClient               *bleClient = nullptr;
 NimBLERemoteCharacteristic *writeChr  = nullptr;
 NimBLERemoteCharacteristic *notifyChr = nullptr;
 
@@ -150,14 +150,14 @@ void loadSettings() {
   settings.wifiSsid          = prefs.getString("wifi_ssid",  MYSSID);
   settings.wifiPsk           = prefs.getString("wifi_psk",   MYPSK);
   settings.bleAddress        = prefs.getString("ble_addr",   "");
-  settings.bleAddrType       = prefs.getString("ble_atype",  "public");
+  settings.bleAddrType       = prefs.getString("ble_atype",  "random");
   settings.bleName           = prefs.getString("ble_name",   "");
   settings.serviceUuid       = prefs.getString("svc_uuid",   "");
   settings.writeUuid         = prefs.getString("wr_uuid",    "");
   settings.notifyUuid        = prefs.getString("nt_uuid",    "");
   settings.autoConnect       = prefs.getBool  ("auto_conn",  false);
-  settings.writeWithResponse = prefs.getBool  ("wr_rsp",     true);
-  settings.scanSeconds       = prefs.getUChar ("scan_sec",   4);
+  settings.writeWithResponse = prefs.getBool  ("wr_rsp",     false);
+  settings.scanSeconds       = prefs.getUChar ("scan_sec",   5);
   prefs.end();
 }
 
@@ -187,7 +187,7 @@ void startPortal() {
   WiFi.softAP(AP_SSID);
   dns.start(DNS_PORT, "*", WiFi.softAPIP());
   portalMode = true;
-  addLog("Captive portal started: SSID=" + String(AP_SSID) + " IP=" + WiFi.softAPIP().toString());
+  addLog("Captive portal: SSID=" + String(AP_SSID) + " IP=" + WiFi.softAPIP().toString());
 }
 
 void stopPortal() {
@@ -238,13 +238,13 @@ void ensureMDNSOTA() {
 // --------------------------------------------------------------------------
 class ClientCB : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient *c) override {
-    addLog("BLE connected: " + String(c->getPeerAddress().toString().c_str()));
+    addLog("BLE onConnect: " + String(c->getPeerAddress().toString().c_str()));
   }
   void onDisconnect(NimBLEClient *c, int reason) override {
     (void)c;
     writeChr  = nullptr;
     notifyChr = nullptr;
-    addLog("BLE disconnected, reason=" + String(reason));
+    addLog("BLE disconnected reason=" + String(reason));
   }
 };
 ClientCB gClientCB;
@@ -255,9 +255,6 @@ void notifyCB(NimBLERemoteCharacteristic *pChr, uint8_t *data, size_t len, bool 
   addLog("RX: " + lastRxHex);
 }
 
-// --------------------------------------------------------------------------
-// BLE scan
-// --------------------------------------------------------------------------
 void deleteBleClient() {
   if (bleClient) {
     if (bleClient->isConnected()) bleClient->disconnect();
@@ -272,12 +269,15 @@ bool isBleReady() {
   return bleClient && bleClient->isConnected() && writeChr;
 }
 
-// Returns JSON array of discovered devices including addrType
+// --------------------------------------------------------------------------
+// BLE scan — returns JSON and populates lastScanJson
+// --------------------------------------------------------------------------
 String scanJson() {
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setActiveScan(true);
-  scan->setInterval(45);
-  scan->setWindow(15);
+  scan->setInterval(100);
+  scan->setWindow(99);
+  scan->clearResults();
 
   addLog("BLE scan start " + String(settings.scanSeconds) + "s");
   scan->start(settings.scanSeconds, false);
@@ -289,22 +289,22 @@ String scanJson() {
 
   for (int i = 0; i < results.getCount(); i++) {
     const NimBLEAdvertisedDevice *dev = results.getDevice(i);
-    String addr  = String(dev->getAddress().toString().c_str());
-    String name  = dev->haveName() ? String(dev->getName().c_str()) : "";
-    int    rssi  = dev->getRSSI();
-    // NimBLE 2.x: getAddress().getType() returns uint8_t
-    uint8_t atype = dev->getAddress().getType();
-    String  atypeStr = (atype == BLE_ADDR_RANDOM) ? "random" : "public";
+    String addr     = String(dev->getAddress().toString().c_str());
+    String name     = dev->haveName() ? String(dev->getName().c_str()) : "";
+    int    rssi     = dev->getRSSI();
+    uint8_t atype   = dev->getAddress().getType();
+    String atypeStr = (atype == BLE_ADDR_RANDOM) ? "random" : "public";
 
     if (!first) json += ",";
     first = false;
     json += "{";
-    json += "\"addr\":\""    + jsonEscape(addr)     + "\",";
-    json += "\"addrType\":\"" + atypeStr             + "\",";
-    json += "\"name\":\""    + jsonEscape(name)     + "\",";
-    json += "\"rssi\":"      + String(rssi);
+    json += "\"addr\":\""     + jsonEscape(addr)   + "\",";
+    json += "\"addrType\":\"" + atypeStr           + "\",";
+    json += "\"name\":\""     + jsonEscape(name)   + "\",";
+    json += "\"rssi\":"       + String(rssi);
     json += "}";
 
+    // auto-resolve target by name filter
     if (currentTargetAddr.isEmpty() && settings.bleName.length() && name.length()) {
       String n1 = name;             n1.toLowerCase();
       String n2 = settings.bleName; n2.toLowerCase();
@@ -312,86 +312,130 @@ String scanJson() {
     }
   }
   json += "]";
-  scan->clearResults();
   lastScanJson = json;
-  addLog("BLE scan done, count=" + String(results.getCount()));
+  addLog("BLE scan done count=" + String(results.getCount()));
   return json;
 }
 
 // --------------------------------------------------------------------------
-// BLE connect
+// BLE connect — scan first to find the live advertised device object,
+// then connect directly to it. This is required for NimBLE 2.x with
+// random-address peripherals that aren't in the peer cache.
 // --------------------------------------------------------------------------
-NimBLEClient* makeClient() {
-  NimBLEClient *c = NimBLEDevice::createClient();
-  c->setClientCallbacks(&gClientCB, false);
-  c->setConnectionParams(12, 12, 0, 200);
-  c->setConnectTimeout(5);
-  return c;
-}
-
-// Try explicit type first, then fall back to the other one
-bool connectByAddressString(const String &target, const String &addrTypeStr) {
-  std::string s(target.c_str());
-
-  uint8_t primaryType   = (addrTypeStr == "random") ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
-  uint8_t secondaryType = (primaryType == BLE_ADDR_PUBLIC) ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
-
-  bleClient = makeClient();
-  if (bleClient->connect(NimBLEAddress(s, primaryType))) {
-    addLog("BLE connected addr_type=" + addrTypeStr);
-    return true;
-  }
-  deleteBleClient();
-
-  addLog("BLE connect failed with " + addrTypeStr + ", trying other type");
-  bleClient = makeClient();
-  if (bleClient->connect(NimBLEAddress(s, secondaryType))) {
-    addLog("BLE connected with fallback addr_type");
-    return true;
-  }
-  deleteBleClient();
-  return false;
-}
-
 bool connectBle() {
   deleteBleClient();
 
   String target = settings.bleAddress;
   target.trim();
+  target.toUpperCase();
 
-  if (target.isEmpty() && settings.bleName.length()) {
-    scanJson();
-    target = currentTargetAddr;
-    if (!target.isEmpty()) addLog("Resolved target from name: " + target);
-  }
-  if (target.isEmpty()) {
-    addLog("BLE connect skipped: no target address");
-    return false;
-  }
   if (settings.serviceUuid.isEmpty() || settings.writeUuid.isEmpty()) {
     addLog("BLE connect skipped: service/write UUID not configured");
     return false;
   }
-
-  addLog("BLE connect to " + target + " type=" + settings.bleAddrType);
-  if (!connectByAddressString(target, settings.bleAddrType)) {
-    addLog("BLE connect failed");
+  if (target.isEmpty() && settings.bleName.isEmpty()) {
+    addLog("BLE connect skipped: no target address or name");
     return false;
   }
+
+  // Step 1: scan to find the live advertising device
+  addLog("BLE pre-connect scan (" + String(settings.scanSeconds) + "s) looking for: " + target);
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(99);
+  scan->clearResults();
+  scan->start(settings.scanSeconds, false);
+  const auto &results = scan->getResults();
+
+  addLog("Pre-connect scan found " + String(results.getCount()) + " device(s)");
+
+  // Find matching device in scan results
+  const NimBLEAdvertisedDevice *found = nullptr;
+  for (int i = 0; i < results.getCount(); i++) {
+    const NimBLEAdvertisedDevice *dev = results.getDevice(i);
+    String addr = String(dev->getAddress().toString().c_str());
+    addr.toUpperCase();
+    String name = dev->haveName() ? String(dev->getName().c_str()) : "";
+    uint8_t atype = dev->getAddress().getType();
+    addLog("  Found: " + addr + " [" + (atype == BLE_ADDR_RANDOM ? "random" : "public") + "] name='" + name + "' rssi=" + String(dev->getRSSI()));
+
+    // match by address
+    if (!target.isEmpty() && addr == target) {
+      found = dev;
+      addLog("  -> Address match!");
+      break;
+    }
+    // match by name
+    if (found == nullptr && settings.bleName.length() && name.length()) {
+      String n1 = name;             n1.toLowerCase();
+      String n2 = settings.bleName; n2.toLowerCase();
+      if (n1.indexOf(n2) >= 0) {
+        found = dev;
+        addLog("  -> Name match: '" + name + "'");
+      }
+    }
+  }
+
+  // Update lastScanJson with what we found
+  String json = "[";
+  bool first = true;
+  for (int i = 0; i < results.getCount(); i++) {
+    const NimBLEAdvertisedDevice *dev = results.getDevice(i);
+    String addr     = String(dev->getAddress().toString().c_str());
+    String name     = dev->haveName() ? String(dev->getName().c_str()) : "";
+    int    rssi     = dev->getRSSI();
+    uint8_t atype   = dev->getAddress().getType();
+    String atypeStr = (atype == BLE_ADDR_RANDOM) ? "random" : "public";
+    if (!first) json += ",";
+    first = false;
+    json += "{\"addr\":\"" + jsonEscape(addr) + "\",\"addrType\":\"" + atypeStr + "\",\"name\":\"" + jsonEscape(name) + "\",\"rssi\":" + String(rssi) + "}";
+  }
+  json += "]";
+  lastScanJson = json;
+
+  if (!found) {
+    addLog("BLE target not found in scan. Is device in pairing/advertising mode?");
+    return false;
+  }
+
+  // Step 2: connect using the live NimBLEAdvertisedDevice object
+  addLog("BLE connecting to " + String(found->getAddress().toString().c_str()));
+  bleClient = NimBLEDevice::createClient();
+  bleClient->setClientCallbacks(&gClientCB, false);
+  bleClient->setConnectionParams(12, 12, 0, 200);
+  // NimBLE 2.x: setConnectTimeout takes SECONDS (uint8_t)
+  bleClient->setConnectTimeout(10);
+
+  if (!bleClient->connect(found)) {
+    addLog("BLE connect() returned false");
+    deleteBleClient();
+    return false;
+  }
+
+  addLog("BLE link up, discovering services...");
 
   NimBLERemoteService *svc = bleClient->getService(NimBLEUUID(settings.serviceUuid.c_str()));
   if (!svc) {
-    addLog("BLE service not found: " + settings.serviceUuid);
+    // Try fetching full service list for debug
+    addLog("Service not found: " + settings.serviceUuid);
+    auto *svcs = bleClient->getServices(true);
+    if (svcs) {
+      for (auto &s : *svcs)
+        addLog("  Available svc: " + String(s.second->getUUID().toString().c_str()));
+    }
     deleteBleClient();
     return false;
   }
+  addLog("Service found");
 
   writeChr = svc->getCharacteristic(NimBLEUUID(settings.writeUuid.c_str()));
   if (!writeChr) {
-    addLog("BLE write chr not found: " + settings.writeUuid);
+    addLog("Write chr not found: " + settings.writeUuid);
     deleteBleClient();
     return false;
   }
+  addLog("Write chr found, canWrite=" + String(writeChr->canWrite() || writeChr->canWriteNoResponse() ? "yes" : "no"));
 
   if (settings.notifyUuid.length()) {
     notifyChr = svc->getCharacteristic(NimBLEUUID(settings.notifyUuid.c_str()));
@@ -401,9 +445,10 @@ bool connectBle() {
       else
         addLog("Notify subscribe failed");
     } else {
-      addLog("Notify chr missing or not subscribable");
+      addLog("Notify chr not subscribable (or not found)");
     }
   }
+
   addLog("BLE ready");
   return true;
 }
@@ -430,126 +475,120 @@ bool sendPacket(const uint8_t *data, size_t len, const char *tag) {
 
 bool sendRawHex(const String &hex) {
   std::vector<uint8_t> buf;
-  if (!parseHexString(hex, buf)) {
-    addLog("Raw hex parse failed");
-    return false;
-  }
+  if (!parseHexString(hex, buf)) { addLog("Raw hex parse failed"); return false; }
   return sendPacket(buf.data(), buf.size(), "RAW");
 }
 
 // --------------------------------------------------------------------------
-// State JSON (for web UI polling)
+// State JSON
 // --------------------------------------------------------------------------
 String makeStateJson() {
   String json;
   json.reserve(4096);
-  String ip     = WiFi.status()==WL_CONNECTED ? WiFi.localIP().toString() : "";
-  String apIp   = portalMode ? WiFi.softAPIP().toString() : "";
-  String blePeer = (bleClient && bleClient->isConnected())
-                 ? String(bleClient->getPeerAddress().toString().c_str()) : "";
-
+  String ip    = WiFi.status()==WL_CONNECTED ? WiFi.localIP().toString() : "";
+  String apIp  = portalMode ? WiFi.softAPIP().toString() : "";
+  String peer  = (bleClient && bleClient->isConnected())
+               ? String(bleClient->getPeerAddress().toString().c_str()) : "";
   json += "{";
-  json += "\"hostname\":\""        + String(HOSTNAME)                                     + "\",";
-  json += "\"wifiConnected\":"      + String(WiFi.status()==WL_CONNECTED?"true":"false")   + ",";
-  json += "\"portalMode\":"         + String(portalMode?"true":"false")                   + ",";
-  json += "\"ip\":\""               + jsonEscape(ip)                                       + "\",";
-  json += "\"apIp\":\""             + jsonEscape(apIp)                                     + "\",";
-  json += "\"ssid\":\""             + jsonEscape(settings.wifiSsid)                        + "\",";
-  json += "\"mac\":\""              + jsonEscape(WiFi.macAddress())                        + "\",";
-  json += "\"rssi\":"               + String(WiFi.status()==WL_CONNECTED?WiFi.RSSI():0)   + ",";
-  json += "\"bleConnected\":"       + String(isBleReady()?"true":"false")                  + ",";
-  json += "\"blePeer\":\""          + jsonEscape(blePeer)                                  + "\",";
-  json += "\"bleAddress\":\""       + jsonEscape(settings.bleAddress)                      + "\",";
-  json += "\"bleAddrType\":\""      + jsonEscape(settings.bleAddrType)                     + "\",";
-  json += "\"bleName\":\""          + jsonEscape(settings.bleName)                         + "\",";
-  json += "\"serviceUuid\":\""      + jsonEscape(settings.serviceUuid)                     + "\",";
-  json += "\"writeUuid\":\""        + jsonEscape(settings.writeUuid)                       + "\",";
-  json += "\"notifyUuid\":\""       + jsonEscape(settings.notifyUuid)                      + "\",";
-  json += "\"autoConnect\":"        + String(settings.autoConnect?"true":"false")          + ",";
-  json += "\"writeWithResponse\":"  + String(settings.writeWithResponse?"true":"false")   + ",";
-  json += "\"scanSeconds\":"        + String(settings.scanSeconds)                         + ",";
-  json += "\"lastTx\":\""           + jsonEscape(lastTxHex)                                + "\",";
-  json += "\"lastRx\":\""           + jsonEscape(lastRxHex)                                + "\",";
-  json += "\"logs\":\""             + jsonEscape(logBuffer)                                + "\",";
-  json += "\"scan\":"               + lastScanJson;
+  json += "\"hostname\":\""       + String(HOSTNAME)                                   + "\",";
+  json += "\"wifiConnected\":"     + String(WiFi.status()==WL_CONNECTED?"true":"false") + ",";
+  json += "\"portalMode\":"        + String(portalMode?"true":"false")                 + ",";
+  json += "\"ip\":\""              + jsonEscape(ip)                                     + "\",";
+  json += "\"apIp\":\""            + jsonEscape(apIp)                                   + "\",";
+  json += "\"ssid\":\""            + jsonEscape(settings.wifiSsid)                      + "\",";
+  json += "\"mac\":\""             + jsonEscape(WiFi.macAddress())                      + "\",";
+  json += "\"rssi\":"              + String(WiFi.status()==WL_CONNECTED?WiFi.RSSI():0) + ",";
+  json += "\"bleConnected\":"      + String(isBleReady()?"true":"false")                + ",";
+  json += "\"blePeer\":\""         + jsonEscape(peer)                                   + "\",";
+  json += "\"bleAddress\":\""      + jsonEscape(settings.bleAddress)                    + "\",";
+  json += "\"bleAddrType\":\""     + jsonEscape(settings.bleAddrType)                   + "\",";
+  json += "\"bleName\":\""         + jsonEscape(settings.bleName)                       + "\",";
+  json += "\"serviceUuid\":\""     + jsonEscape(settings.serviceUuid)                   + "\",";
+  json += "\"writeUuid\":\""       + jsonEscape(settings.writeUuid)                     + "\",";
+  json += "\"notifyUuid\":\""      + jsonEscape(settings.notifyUuid)                    + "\",";
+  json += "\"autoConnect\":"       + String(settings.autoConnect?"true":"false")        + ",";
+  json += "\"writeWithResponse\":" + String(settings.writeWithResponse?"true":"false") + ",";
+  json += "\"scanSeconds\":"       + String(settings.scanSeconds)                       + ",";
+  json += "\"lastTx\":\""          + jsonEscape(lastTxHex)                              + "\",";
+  json += "\"lastRx\":\""          + jsonEscape(lastRxHex)                              + "\",";
+  json += "\"logs\":\""            + jsonEscape(logBuffer)                              + "\",";
+  json += "\"scan\":"              + lastScanJson;
   json += "}";
   return json;
 }
 
 // --------------------------------------------------------------------------
-// Web server handlers
+// Web handlers
 // --------------------------------------------------------------------------
-void sendOk(const String &msg)  { server.send(200,"application/json","{\"ok\":true,\"msg\":\"" +jsonEscape(msg)+"\"}"); }
-void sendErr(const String &msg) { server.send(200,"application/json","{\"ok\":false,\"msg\":\"" +jsonEscape(msg)+"\"}"); }
+void sendOk(const String &m)  { server.send(200,"application/json","{\"ok\":true,\"msg\":\""+jsonEscape(m)+"\"}"); }
+void sendErr(const String &m) { server.send(200,"application/json","{\"ok\":false,\"msg\":\""+jsonEscape(m)+"\"}"); }
 
-bool argBool(const char *name, bool defVal) {
-  if (!server.hasArg(name)) return defVal;
-  String v = server.arg(name); v.toLowerCase();
+bool argBool(const char *n, bool d) {
+  if (!server.hasArg(n)) return d;
+  String v=server.arg(n); v.toLowerCase();
   return v=="1"||v=="true"||v=="on"||v=="yes";
 }
 
-void handleRoot()      { server.send_P(200, "text/html", INDEX_HTML); }
-void handleState()     { server.send(200, "application/json", makeStateJson()); }
-void handleScan()      { server.send(200, "application/json", scanJson()); }
+void handleRoot()   { server.send_P(200,"text/html",INDEX_HTML); }
+void handleState()  { server.send(200,"application/json",makeStateJson()); }
+void handleScan()   { server.send(200,"application/json",scanJson()); }
 
 void handleSaveConfig() {
   settings.bleAddress        = server.arg("bleAddress");
+  settings.bleAddress.trim();
   settings.bleAddrType       = server.arg("bleAddrType");
   if (settings.bleAddrType != "random") settings.bleAddrType = "public";
   settings.bleName           = server.arg("bleName");
   settings.serviceUuid       = server.arg("serviceUuid");
+  settings.serviceUuid.trim();
   settings.writeUuid         = server.arg("writeUuid");
+  settings.writeUuid.trim();
   settings.notifyUuid        = server.arg("notifyUuid");
+  settings.notifyUuid.trim();
   settings.autoConnect       = argBool("autoConnect",       settings.autoConnect);
   settings.writeWithResponse = argBool("writeWithResponse", settings.writeWithResponse);
   if (server.hasArg("scanSeconds")) {
-    int v = server.arg("scanSeconds").toInt();
-    if (v < 1) v = 1;
-    if (v > 20) v = 20;
-    settings.scanSeconds = (uint8_t)v;
+    int v=server.arg("scanSeconds").toInt();
+    if(v<1)v=1; if(v>20)v=20;
+    settings.scanSeconds=(uint8_t)v;
   }
   saveSettings();
+  addLog("Config: addr=" + settings.bleAddress + " type=" + settings.bleAddrType);
+  addLog("Config: svc=" + settings.serviceUuid);
+  addLog("Config: wr=" + settings.writeUuid + " nt=" + settings.notifyUuid);
   sendOk("Config saved");
 }
 
 void handleSaveWifi() {
-  settings.wifiSsid = server.arg("ssid");
-  settings.wifiPsk  = server.arg("psk");
-  saveSettings();
-  beginWiFi(portalMode);
-  sendOk("WiFi saved, reconnect started");
+  settings.wifiSsid=server.arg("ssid");
+  settings.wifiPsk=server.arg("psk");
+  saveSettings(); beginWiFi(portalMode);
+  sendOk("WiFi saved, reconnecting");
 }
 
-void handleConnect()    { connectBle()    ? sendOk("BLE connected")    : sendErr("BLE connect failed"); }
+void handleConnect()    { connectBle()  ? sendOk("BLE connected")    : sendErr("BLE connect failed — check log"); }
 void handleDisconnect() { disconnectBle(); sendOk("BLE disconnected"); }
-void handleSendFF()     { sendPacket(PKT_FF,sizeof(PKT_FF),"FF") ? sendOk("FF sent")  : sendErr("FF send failed"); }
-void handleSendFE()     { sendPacket(PKT_FE,sizeof(PKT_FE),"FE") ? sendOk("FE sent")  : sendErr("FE send failed"); }
-void handleSendRaw()    { sendRawHex(server.arg("hex"))           ? sendOk("Raw sent") : sendErr("Raw send failed"); }
-
-void handleClearLog() {
-  logBuffer = ""; lastTxHex = ""; lastRxHex = "";
-  sendOk("Log cleared");
-}
-
-void handleReboot() {
-  sendOk("Rebooting"); delay(200); ESP.restart();
-}
+void handleSendFF()     { sendPacket(PKT_FF,sizeof(PKT_FF),"FF") ? sendOk("FF sent")  : sendErr("FF failed"); }
+void handleSendFE()     { sendPacket(PKT_FE,sizeof(PKT_FE),"FE") ? sendOk("FE sent")  : sendErr("FE failed"); }
+void handleSendRaw()    { sendRawHex(server.arg("hex"))            ? sendOk("Raw sent") : sendErr("Raw failed"); }
+void handleClearLog()   { logBuffer=""; lastTxHex=""; lastRxHex=""; sendOk("Log cleared"); }
+void handleReboot()     { sendOk("Rebooting"); delay(200); ESP.restart(); }
 
 void setupWeb() {
-  server.on("/",                HTTP_GET,  handleRoot);
-  server.on("/api/state",       HTTP_GET,  handleState);
-  server.on("/api/scan",        HTTP_GET,  handleScan);
-  server.on("/api/saveConfig",  HTTP_POST, handleSaveConfig);
-  server.on("/api/saveWifi",    HTTP_POST, handleSaveWifi);
-  server.on("/api/connect",     HTTP_POST, handleConnect);
-  server.on("/api/disconnect",  HTTP_POST, handleDisconnect);
-  server.on("/api/sendFF",      HTTP_POST, handleSendFF);
-  server.on("/api/sendFE",      HTTP_POST, handleSendFE);
-  server.on("/api/sendRaw",     HTTP_POST, handleSendRaw);
-  server.on("/api/clearLog",    HTTP_POST, handleClearLog);
-  server.on("/api/reboot",      HTTP_POST, handleReboot);
-  server.onNotFound([]() {
-    if (portalMode) { server.sendHeader("Location","/",true); server.send(302,"text/plain",""); }
+  server.on("/",               HTTP_GET,  handleRoot);
+  server.on("/api/state",      HTTP_GET,  handleState);
+  server.on("/api/scan",       HTTP_GET,  handleScan);
+  server.on("/api/saveConfig", HTTP_POST, handleSaveConfig);
+  server.on("/api/saveWifi",   HTTP_POST, handleSaveWifi);
+  server.on("/api/connect",    HTTP_POST, handleConnect);
+  server.on("/api/disconnect", HTTP_POST, handleDisconnect);
+  server.on("/api/sendFF",     HTTP_POST, handleSendFF);
+  server.on("/api/sendFE",     HTTP_POST, handleSendFE);
+  server.on("/api/sendRaw",    HTTP_POST, handleSendRaw);
+  server.on("/api/clearLog",   HTTP_POST, handleClearLog);
+  server.on("/api/reboot",     HTTP_POST, handleReboot);
+  server.onNotFound([](){
+    if(portalMode){ server.sendHeader("Location","/",true); server.send(302,"text/plain",""); }
     else server.send(404,"text/plain","Not found");
   });
   server.begin();
@@ -560,30 +599,21 @@ void setupWeb() {
 // Service loops
 // --------------------------------------------------------------------------
 void serviceWiFi() {
-  bool connected = (WiFi.status() == WL_CONNECTED);
-  if (connected && !wifiWasConnected) {
-    wifiWasConnected = true;
-    addLog("WiFi connected: " + WiFi.localIP().toString());
-    ensureMDNSOTA();
-    stopPortal();
-  }
-  if (!connected && wifiWasConnected) {
-    wifiWasConnected = false;
-    addLog("WiFi disconnected");
-    lastWifiTryMs = millis();
-  }
-  if (!connected) {
-    if (millis() - lastWifiTryMs > 15000) beginWiFi(portalMode);
-    if (!portalMode && millis() > 30000 && millis() - lastWifiTryMs > 10000) startPortal();
+  bool up=(WiFi.status()==WL_CONNECTED);
+  if(up && !wifiWasConnected){ wifiWasConnected=true; addLog("WiFi up: "+WiFi.localIP().toString()); ensureMDNSOTA(); stopPortal(); }
+  if(!up && wifiWasConnected){ wifiWasConnected=false; addLog("WiFi down"); lastWifiTryMs=millis(); }
+  if(!up){
+    if(millis()-lastWifiTryMs>15000) beginWiFi(portalMode);
+    if(!portalMode && millis()>30000 && millis()-lastWifiTryMs>10000) startPortal();
   }
 }
 
 void serviceBleAutoConnect() {
-  if (!settings.autoConnect) return;
-  if (isBleReady()) return;
-  if (settings.serviceUuid.isEmpty() || settings.writeUuid.isEmpty()) return;
-  if (millis() - lastBleTryMs < 10000) return;
-  lastBleTryMs = millis();
+  if(!settings.autoConnect) return;
+  if(isBleReady()) return;
+  if(settings.serviceUuid.isEmpty()||settings.writeUuid.isEmpty()) return;
+  if(millis()-lastBleTryMs<15000) return;
+  lastBleTryMs=millis();
   addLog("BLE auto-connect attempt");
   connectBle();
 }
@@ -596,40 +626,35 @@ void setup() {
   delay(200);
   addLog("Boot");
   loadSettings();
+  addLog("Loaded: addr=" + settings.bleAddress + " type=" + settings.bleAddrType);
+  addLog("Loaded: svc=" + settings.serviceUuid);
+  addLog("Loaded: wr=" + settings.writeUuid);
 
-  WiFi.disconnect(true, true);
+  WiFi.disconnect(true,true);
   delay(200);
   beginWiFi(false);
 
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  addLog("NimBLE init done");
 
   setupWeb();
 
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) {
-    delay(100);
-    server.handleClient();
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    addLog("WiFi timeout, starting captive portal");
-    startPortal();
-  } else {
-    ensureMDNSOTA();
-  }
+  unsigned long t0=millis();
+  while(WiFi.status()!=WL_CONNECTED && millis()-t0<12000){ delay(100); server.handleClient(); }
+  if(WiFi.status()!=WL_CONNECTED){ addLog("WiFi timeout, starting portal"); startPortal(); }
+  else ensureMDNSOTA();
 }
 
 void loop() {
   server.handleClient();
-  if (portalMode) dns.processNextRequest();
-  if (otaReady && WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
+  if(portalMode) dns.processNextRequest();
+  if(otaReady && WiFi.status()==WL_CONNECTED) ArduinoOTA.handle();
   serviceWiFi();
   serviceBleAutoConnect();
-  if (millis() - lastStateMs > 10000) {
-    lastStateMs = millis();
-    addLog("State wifi=" + String(WiFi.status()==WL_CONNECTED?"up":"down")
-         + " ble=" + String(isBleReady()?"up":"down"));
+  if(millis()-lastStateMs>10000){
+    lastStateMs=millis();
+    addLog("Heartbeat wifi="+String(WiFi.status()==WL_CONNECTED?"up":"down")+" ble="+String(isBleReady()?"up":"down"));
   }
   delay(5);
 }
