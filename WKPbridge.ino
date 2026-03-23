@@ -1,7 +1,6 @@
 // WKPbridge.ino
 // ESP32-C3 BLE-to-WiFi bridge + MQTT/HA forwarding + web UI + OTA
-// NimBLE 2.x: scan duration is MILLISECONDS, not seconds.
-// Use getResults(durationMs) for blocking scan instead of start()+getResults().
+// Wyze Lock requires BLE pairing/bonding. Enable NimBLE security manager.
 
 #define DEBUG_SERIAL 1
 
@@ -111,8 +110,7 @@ String bytesToHex(const uint8_t *data, size_t len) {
   const char *hc = "0123456789ABCDEF";
   String out; out.reserve(len * 3);
   for (size_t i = 0; i < len; i++) {
-    out += hc[(data[i]>>4)&0x0F];
-    out += hc[data[i]&0x0F];
+    out += hc[(data[i]>>4)&0x0F]; out += hc[data[i]&0x0F];
     if (i+1<len) out += ' ';
   }
   return out;
@@ -191,14 +189,12 @@ void saveSettings() {
 void startPortal() {
   if(portalMode) return;
   WiFi.mode(WIFI_AP_STA); WiFi.softAP(AP_SSID);
-  dns.start(DNS_PORT,"*",WiFi.softAPIP());
-  portalMode=true;
+  dns.start(DNS_PORT,"*",WiFi.softAPIP()); portalMode=true;
   addLog("Portal: "+String(AP_SSID)+" "+WiFi.softAPIP().toString());
 }
 void stopPortal() {
   if(!portalMode) return;
-  dns.stop(); WiFi.softAPdisconnect(true);
-  portalMode=false; addLog("Portal stopped");
+  dns.stop(); WiFi.softAPdisconnect(true); portalMode=false; addLog("Portal stopped");
 }
 void beginWiFi(bool keepAp) {
   WiFi.persistent(false); WiFi.setAutoReconnect(true);
@@ -229,16 +225,22 @@ void ensureMDNSOTA() {
 // --------------------------------------------------------------------------
 void mqttPublish(const String &payload) {
   if(settings.mqttHost.isEmpty()) return;
-  addLog("MQTT publish (stub): "+payload);
+  addLog("MQTT (stub): "+payload);
 }
-void serviceMQTT() { /* TODO: PubSubClient */ }
+void serviceMQTT() { }
 
 // --------------------------------------------------------------------------
-// BLE callbacks
+// BLE Security callbacks
+// The Wyze Lock almost certainly requires Just Works or passkey pairing.
+// onConfirmPin: auto-confirm numeric comparison (Just Works).
+// onAuthenticationComplete: log the result so we know what happened.
 // --------------------------------------------------------------------------
-class ClientCB : public NimBLEClientCallbacks {
+class SecurityCB : public NimBLEClientCallbacks {
+public:
   void onConnect(NimBLEClient *c) override {
     addLog("BLE onConnect: "+String(c->getPeerAddress().toString().c_str()));
+    // Request connection parameter update for faster throughput
+    c->updateConnParams(12,12,0,200);
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
   void onDisconnect(NimBLEClient *c, int reason) override {
@@ -246,8 +248,25 @@ class ClientCB : public NimBLEClientCallbacks {
     addLog("BLE disconnected reason="+String(reason));
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
+  // Called when a passkey is needed for pairing
+  uint32_t onPassKeyEntry() override {
+    addLog("BLE pairing: passkey requested (using 000000)");
+    return 000000;  // most locks use 000000 or 123456
+  }
+  // Called for numeric comparison (Just Works)
+  bool onConfirmPin(uint32_t pin) override {
+    addLog("BLE pairing: confirm pin="+String(pin)+" -> YES");
+    return true;
+  }
+  void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
+    if(connInfo.isEncrypted()){
+      addLog("BLE pairing SUCCESS: encrypted="+String(connInfo.isEncrypted())+" bonded="+String(connInfo.isBonded()));
+    } else {
+      addLog("BLE pairing FAILED or not required (unencrypted link)");
+    }
+  }
 };
-ClientCB gClientCB;
+SecurityCB gClientCB;
 
 void notifyCB(NimBLERemoteCharacteristic *pChr, uint8_t *data, size_t len, bool isNotify) {
   (void)pChr; (void)isNotify;
@@ -261,12 +280,6 @@ bool isBleReady() { return bleClient && bleClient->isConnected() && writeChr; }
 
 // --------------------------------------------------------------------------
 // BLE scan
-//
-// NimBLE 2.x KEY CHANGE: duration is MILLISECONDS not seconds.
-// Use the blocking getResults(durationMs) overload which internally calls
-// start() and waits on a task semaphore for BLE_GAP_EVENT_DISC_COMPLETE.
-// Do NOT call start() manually and then getResults() — that returns
-// immediately because the scan is still in progress.
 // --------------------------------------------------------------------------
 const NimBLEAdvertisedDevice* doScanFindTarget(uint8_t secs, const String &targetUpper) {
   if(scanRunning){ addLog("Scan busy"); return nullptr; }
@@ -277,16 +290,13 @@ const NimBLEAdvertisedDevice* doScanFindTarget(uint8_t secs, const String &targe
 
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setActiveScan(true);
-  scan->setInterval(40);   // 40 * 0.625ms = 25ms interval
-  scan->setWindow(40);     // window == interval = 100% duty cycle
+  scan->setInterval(40);
+  scan->setWindow(40);
   scan->setDuplicateFilter(false);
 
-  uint32_t durationMs = (uint32_t)secs * 1000;  // MILLISECONDS
+  uint32_t durationMs = (uint32_t)secs * 1000;
   addLog("BLE scan "+String(secs)+"s ("+String(durationMs)+"ms)");
-
-  // getResults(ms) = blocking: starts scan, waits for completion, returns results
   NimBLEScanResults results = scan->getResults(durationMs, false);
-
   addLog("Scan done: "+String(results.getCount())+" device(s)");
 
   const NimBLEAdvertisedDevice *found = nullptr;
@@ -297,8 +307,8 @@ const NimBLEAdvertisedDevice* doScanFindTarget(uint8_t secs, const String &targe
     const NimBLEAdvertisedDevice *dev = results.getDevice(i);
     String addr  = String(dev->getAddress().toString().c_str());
     String addrUp = addr; addrUp.toUpperCase();
-    String name  = dev->haveName() ? String(dev->getName().c_str()) : "";
-    int    rssi  = dev->getRSSI();
+    String name  = dev->haveName()?String(dev->getName().c_str()):"";
+    int rssi     = dev->getRSSI();
     uint8_t at   = dev->getAddress().getType();
     String ats   = (at==BLE_ADDR_RANDOM)?"random":"public";
     addLog("  "+addrUp+" ["+ats+"] '"+name+"' rssi="+String(rssi));
@@ -310,8 +320,7 @@ const NimBLEAdvertisedDevice* doScanFindTarget(uint8_t secs, const String &targe
       if(n1.indexOf(n2)>=0){ found=dev; addLog("  -> name match '"+name+"'"); currentTargetAddr=addr; }
     }
   }
-  json+="]";
-  lastScanJson=json;
+  json+="]"; lastScanJson=json;
   scanRunning=false;
   return found;
 }
@@ -337,7 +346,6 @@ bool connectBle() {
     addLog("Connect skipped: no target"); return false;
   }
 
-  // coex already set to BLE inside doScanFindTarget
   const NimBLEAdvertisedDevice *found=doScanFindTarget(settings.scanSeconds,target);
   if(!found){
     addLog("Target not found in scan");
@@ -346,16 +354,26 @@ bool connectBle() {
 
   addLog("Connecting to "+String(found->getAddress().toString().c_str()));
   bleClient=NimBLEDevice::createClient();
-  bleClient->setClientCallbacks(&gClientCB,false);
+  bleClient->setClientCallbacks(&gClientCB, false);
   bleClient->setConnectionParams(12,12,0,200);
-  bleClient->setConnectTimeout(10);
+  bleClient->setConnectTimeout(15);  // seconds
 
   if(!bleClient->connect(found)){
-    addLog("connect() failed"); deleteBleClient();
-    esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
+    // Log the disconnect reason from the client info
+    addLog("connect() failed");
+    deleteBleClient(); esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
-  addLog("Link up, discovering services...");
+  addLog("TCP link up");
 
+  // Wyze Lock may require encryption/authentication before GATT operations
+  // secureConnection() will initiate pairing if needed
+  addLog("Securing connection (pairing if needed)...");
+  if(!bleClient->secureConnection()){
+    addLog("WARNING: secureConnection() failed - trying GATT anyway");
+    // Don't abort - some devices allow unencrypted GATT for discovery
+  }
+
+  addLog("Discovering services...");
   NimBLERemoteService *svc=bleClient->getService(NimBLEUUID(settings.serviceUuid.c_str()));
   if(!svc){
     addLog("Service not found: "+settings.serviceUuid);
@@ -378,7 +396,7 @@ bool connectBle() {
       else addLog("Notify subscribe failed");
     } else addLog("Notify chr not subscribable");
   }
-  // onConnect restores coex balance
+
   addLog("BLE ready");
   return true;
 }
@@ -448,8 +466,7 @@ String makeStateJson() {
 void sendOk(const String &m)  { server.send(200,"application/json","{\"ok\":true,\"msg\":\""+jsonEscape(m)+"\"}"); }
 void sendErr(const String &m) { server.send(200,"application/json","{\"ok\":false,\"msg\":\""+jsonEscape(m)+"\"}"); }
 bool argBool(const char *n, bool d){
-  if(!server.hasArg(n)) return d;
-  String v=server.arg(n); v.toLowerCase();
+  if(!server.hasArg(n)) return d; String v=server.arg(n); v.toLowerCase();
   return v=="1"||v=="true"||v=="on"||v=="yes";
 }
 void handleRoot()  { server.send_P(200,"text/html",INDEX_HTML); }
@@ -476,6 +493,12 @@ void handleSaveWifi(){
   settings.wifiSsid=server.arg("ssid"); settings.wifiPsk=server.arg("psk");
   saveSettings(); beginWiFi(portalMode); sendOk("WiFi saved");
 }
+// Clear all stored BLE bonds so the lock treats us as a new device
+void handleClearBonds(){
+  NimBLEDevice::deleteAllBonds();
+  addLog("All BLE bonds cleared");
+  sendOk("Bonds cleared — reconnect to re-pair");
+}
 void handleConnect()   { connectBle()  ?sendOk("BLE connected"):sendErr("Failed — check log"); }
 void handleDisconnect(){ disconnectBle(); sendOk("Disconnected"); }
 void handleSendFF()    { sendPacket(PKT_FF,sizeof(PKT_FF),"FF")?sendOk("FF sent"):sendErr("FF failed"); }
@@ -496,6 +519,7 @@ void setupWeb(){
   server.on("/api/sendFE",     HTTP_POST, handleSendFE);
   server.on("/api/sendRaw",    HTTP_POST, handleSendRaw);
   server.on("/api/clearLog",   HTTP_POST, handleClearLog);
+  server.on("/api/clearBonds", HTTP_POST, handleClearBonds);
   server.on("/api/reboot",     HTTP_POST, handleReboot);
   server.onNotFound([](){
     if(portalMode){server.sendHeader("Location","/",true);server.send(302,"text/plain","");}
@@ -535,10 +559,18 @@ void setup(){
 
   WiFi.disconnect(true,true); delay(200);
   beginWiFi(false);
+
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+  // Enable security manager for pairing/bonding
+  // IO capability: NoInputNoOutput = Just Works pairing (no PIN needed)
+  // If the lock requires a PIN, change to KeyboardOnly or DisplayYesNo
+  NimBLEDevice::setSecurityAuth(true, true, true);  // bonding, MITM, SC
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);  // Just Works
+
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
-  addLog("NimBLE init done");
+  addLog("NimBLE init done, security enabled");
   setupWeb();
 
   unsigned long t0=millis();
