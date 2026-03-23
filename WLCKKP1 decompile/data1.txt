@@ -1,0 +1,574 @@
+                             **************************************************************
+                             *                          FUNCTION                          *
+                             **************************************************************
+                             undefined FUN_0002f8e4()
+             undefined         <UNASSIGNED>   <RETURN>
+             undefined1        Stack[-0x8]:1  local_8                                 XREF[2]:     0002f8e6(R), 
+                                                                                                   0002f8ee(W)  
+             undefined4        Stack[-0xc]:4  local_c                                 XREF[2,1]:   0002f912(W), 
+                                                                                                   0002f916(W), 
+                                                                                                   0002f924(W)  
+             undefined4        Stack[-0x10]:4 local_10                                XREF[2,1]:   0002f910(W), 
+                                                                                                   0002f91a(W), 
+                                                                                                   0002f928(W)  
+                             FUN_0002f8e4                                    XREF[1]:     FUN_000299e0:000299fc(c)  
+        0002f8e4 0e b5           push       {r1,r2,r3,lr}
+        0002f8e6 9d f8 08 00     ldrb.w     r0,[sp,#local_8]
+        0002f8ea 20 f0 ff 00     bic        r0,r0,#0xff
+        0002f8ee 8d f8 08 00     strb.w     r0,[sp,#local_8]
+        0002f8f2 ff f7 3f fa     bl         FUN_0002ed74                                     undefined FUN_0002ed74()
+        0002f8f6 00 28           cmp        r0,#0x0
+        0002f8f8 22 d0           beq        LAB_0002f940
+        0002f8fa 07 22           movs       r2,#0x7
+        0002f8fc 19 a1           adr        r1,[0x2f964]
+        0002f8fe 02 a8           add        r0,sp,#0x8
+        0002f900 7c df           svc        0x7c
+                             LAB_0002f902                                    XREF[2]:     0002f956(j), 0002f960(j)  
+        0002f902 20 b1           cbz        r0,LAB_0002f90e
+        0002f904 19 a2           adr        r2,[s_..\..\..\src\bsp\ble_platform\bl_0002f96c] = "..\\..\\..\\src\\bsp\\ble_pla
+        0002f906 4f f4 56 71     mov.w      r1,#0x358
+        0002f90a f6 f7 83 fc     bl         FUN_00026214                                     undefined FUN_00026214()
+                             LAB_0002f90e                                    XREF[1]:     0002f902(j)  
+        0002f90e 00 20           movs       r0,#0x0
+        0002f910 00 90           str        r0,[sp,#0x0]=>local_10
+        0002f912 01 90           str        r0,[sp,#local_c]
+        0002f914 06 21           movs       r1,#0x6
+        0002f916 ad f8 04 00     strh.w     r0,[sp,#local_c]
+        0002f91a ad f8 00 10     strh.w     r1,[sp,#0x0]=>local_10
+        0002f91e 4f f4 c8 70     mov.w      r0,#0x190
+        0002f922 08 21           movs       r1,#0x8
+        0002f924 ad f8 06 00     strh.w     r0,[sp,#local_c+0x2]
+        0002f928 ad f8 02 10     strh.w     r1,[sp,#local_10+0x2]
+        0002f92c 68 46           mov        r0,sp
+        0002f92e 7a df           svc        0x7a
+        0002f930 00 28           cmp        r0,#0x0
+        0002f932 04 d0           beq        LAB_0002f93e
+        0002f934 0d a2           adr        r2,[s_..\..\..\src\bsp\ble_platform\bl_0002f96c] = "..\\..\\..\\src\\bsp\\ble_pla
+        0002f936 40 f2 63 31     movw       r1,#0x363
+        0002f93a f6 f7 6b fc     bl         FUN_00026214                                     undefined FUN_00026214()
+                             LAB_0002f93e                                    XREF[1]:     0002f932(j)  
+        0002f93e 0e bd           pop        {r1,r2,r3,pc}
+                             LAB_0002f940                                    XREF[1]:     0002f8f8(j)  
+        0002f940 00 f0 44 fb     bl         FUN_0002ffcc                                     undefined FUN_0002ffcc()
+        0002f944 05 22           movs       r2,#0x5
+        0002f946 15 a1           adr        r1,[s_KP-01_0002f99c]                            = "KP-01"
+        0002f948 f6 f7 07 fe     bl         FUN_0002655a                                     undefined FUN_0002655a()
+        0002f94c 20 b1           cbz        r0,LAB_0002f958
+        0002f94e 08 22           movs       r2,#0x8
+        0002f950 14 a1           adr        r1,[0x2f9a4]
+        0002f952 02 a8           add        r0,sp,#0x8
+        0002f954 7c df           svc        0x7c
+        0002f956 d4 e7           b          LAB_0002f902
+                             LAB_0002f958                                    XREF[1]:     0002f94c(j)  
+        0002f958 09 22           movs       r2,#0x9
+        0002f95a 15 a1           adr        r1,[0x2f9b0]
+        0002f95c 02 a8           add        r0,sp,#0x8
+        0002f95e 7c df           svc        0x7c
+
+
+
+
+                             **************************************************************
+                             *                          FUNCTION                          *
+                             **************************************************************
+                             undefined FUN_00027f7c()
+             undefined         <UNASSIGNED>   <RETURN>
+             undefined4        Stack[-0x18]:4 local_18                                XREF[1]:     00027fd8(W)  
+             undefined4        Stack[-0x1c]:4 local_1c                                XREF[1]:     00028098(W)  
+             undefined2        Stack[-0x20]:2 local_20                                XREF[1]:     00028090(W)  
+             undefined2        Stack[-0x24]:2 local_24                                XREF[1]:     0002808a(W)  
+             undefined4        Stack[-0x28]:4 local_28                                XREF[3]:     00027fd4(W), 
+                                                                                                   00027ffe(W), 
+                                                                                                   0002805e(W)  
+             undefined4        Stack[-0x2c]:4 local_2c                                XREF[3]:     00027fd2(W), 
+                                                                                                   00028002(W), 
+                                                                                                   00028056(W)  
+             undefined4        Stack[-0x30]:4 local_30                                XREF[3]:     00027fd0(W), 
+                                                                                                   00027ff6(W), 
+                                                                                                   00028050(W)  
+             undefined4        Stack[-0x34]:4 local_34                                XREF[1]:     00027f94(W)  
+             undefined4        Stack[-0x38]:4 local_38                                XREF[1]:     00027fa0(W)  
+             undefined4        Stack[-0x3c]:4 local_3c                                XREF[1]:     00027f9e(W)  
+             undefined4        Stack[-0x40]:4 local_40                                XREF[1]:     00027f9c(W)  
+             undefined1        Stack[-0x42]:1 local_42                                XREF[2]:     00027fa2(R), 
+                                                                                                   00028066(R)  
+             undefined1        Stack[-0x43]:1 local_43                                XREF[1]:     00027fa6(R)  
+             undefined1        Stack[-0x44]:1 local_44                                XREF[1]:     00027faa(R)  
+             undefined1        Stack[-0x45]:1 local_45                                XREF[1]:     00027f96(R)  
+             undefined1        Stack[-0x46]:1 local_46                                XREF[1]:     00027fb2(R)  
+             undefined1        Stack[-0x47]:1 local_47                                XREF[1]:     00027fb8(R)  
+             undefined4        Stack[-0x50]:4 local_50                                XREF[1]:     000280b2(W)  
+             undefined4        Stack[-0x68]:4 local_68                                XREF[1]:     000280ae(W)  
+             undefined4        Stack[-0x6c]:4 local_6c                                XREF[1]:     0002802e(W)  
+             undefined1        Stack[-0x78]:1 local_78                                XREF[1]:     00028026(W)  
+             undefined1        Stack[-0x7c]:1 local_7c                                XREF[1]:     00028022(W)  
+             undefined4        Stack[-0x94]:4 local_94                                XREF[1]:     00028084(W)  
+             undefined4        Stack[-0xd0]:4 local_d0                                XREF[1]:     0002802a(W)  
+             undefined4        Stack[-0xe0]:4 local_e0                                XREF[1]:     0002801a(W)  
+             undefined2        Stack[-0xe4]:2 local_e4                                XREF[1]:     0002801c(W)  
+             undefined1        Stack[-0xf1]:1 local_f1                                XREF[1]:     00028012(W)  
+             undefined1        Stack[-0xf2]:1 local_f2                                XREF[1]:     0002800c(W)  
+             undefined1        Stack[-0xf4]:1 local_f4                                XREF[1]:     00028008(W)  
+             undefined4        Stack[-0x104   local_104                               XREF[1]:     00027fae(W)  
+             undefined4        Stack[-0x108   local_108                               XREF[1]:     00027fb6(W)  
+                             FUN_00027f7c                                    XREF[1]:     0002813e(c)  
+        00027f7c 70 b5           push       {r4,r5,r6,lr}
+        00027f7e be b0           sub        sp,#0xf8
+        00027f80 04 46           mov        r4,r0
+        00027f82 30 a8           add        r0,sp,#0xc0
+        00027f84 6d df           svc        0x6d
+        00027f86 20 b1           cbz        r0,LAB_00027f92
+        00027f88 54 a2           adr        r2,[s_..\..\..\src\bsp\ble_platform\bl_000280dc] = "..\\..\\..\\src\\bsp\\ble_pla
+        00027f8a 4f f4 9c 61     mov.w      r1=>LAB_000004e0,#0x4e0
+        00027f8e fe f7 41 f9     bl         FUN_00026214                                     undefined FUN_00026214()
+                             LAB_00027f92                                    XREF[1]:     00027f86(j)  
+        00027f92 00 26           movs       r6,#0x0
+        00027f94 35 96           str        r6,[sp,#local_34]
+        00027f96 9d f8 c3 00     ldrb.w     r0,[sp,#local_45]
+        00027f9a 01 ad           add        r5,sp,#0x4
+        00027f9c 32 96           str        r6,[sp,#local_40]
+        00027f9e 33 96           str        r6,[sp,#local_3c]
+        00027fa0 34 96           str        r6,[sp,#local_38]
+        00027fa2 9d f8 c6 30     ldrb.w     r3,[sp,#local_42]
+        00027fa6 9d f8 c5 20     ldrb.w     r2,[sp,#local_43]
+        00027faa 9d f8 c4 10     ldrb.w     r1,[sp,#local_44]
+        00027fae 85 e8 0f 00     stm        r5=>local_104,{r0,r1,r2,r3}
+        00027fb2 9d f8 c2 00     ldrb.w     r0,[sp,#local_46]
+        00027fb6 00 90           str        r0,[sp,#0x0]=>local_108
+        00027fb8 9d f8 c1 30     ldrb.w     r3,[sp,#local_47]
+        00027fbc 53 a2           adr        r2,[s_%02X%02X%02X%02X%02X%02X_0002810c]         = "%02X%02X%02X%02X%02X%02X"
+        00027fbe 0d 21           movs       r1,#0xd
+        00027fc0 32 a8           add        r0,sp,#0xc8
+        00027fc2 ff f7 41 fd     bl         FUN_00027a48                                     undefined FUN_00027a48()
+        00027fc6 0c 21           movs       r1,#0xc
+        00027fc8 32 a8           add        r0,sp,#0xc8
+        00027fca 0d f0 27 fc     bl         FUN_0003581c                                     undefined FUN_0003581c()
+        00027fce 56 48           ldr        r0,[DAT_00028128]                                = 00038434h
+        00027fd0 36 96           str        r6,[sp,#local_30]
+        00027fd2 37 96           str        r6,[sp,#local_2c]
+        00027fd4 38 96           str        r6,[sp,#local_28]
+        00027fd6 40 68           ldr        r0,[r0,#0x4]=>DAT_00038438                       = 0001180Fh
+        00027fd8 3c 90           str        r0,[sp,#local_18]
+        00027fda 02 25           movs       r5,#0x2
+        00027fdc ac 21           movs       r1,#0xac
+        00027fde 05 a8           add        r0,sp,#0x14
+        00027fe0 fe f7 a9 fa     bl         FUN_00026536                                     undefined FUN_00026536()
+        00027fe4 06 f0 c6 fe     bl         FUN_0002ed74                                     undefined FUN_0002ed74()
+        00027fe8 40 b3           cbz        r0,LAB_0002803c
+        00027fea 20 78           ldrb       r0,[r4,#0x0]
+        00027fec 58 b1           cbz        r0,LAB_00028006
+        00027fee 60 78           ldrb       r0,[r4,#0x1]
+        00027ff0 a1 78           ldrb       r1,[r4,#0x2]
+        00027ff2 00 eb 01 20     add.w      r0,r0,r1, lsl #0x8
+        00027ff6 ad f8 d8 00     strh.w     r0,[sp,#local_30]
+        00027ffa 14 f8 03 0b     ldrb.w     r0,[r4],#0x3
+        00027ffe 38 94           str        r4,[sp,#local_28]
+        00028000 80 1e           subs       r0,r0,#0x2
+        00028002 ad f8 dc 00     strh.w     r0,[sp,#local_2c]
+                             LAB_00028006                                    XREF[2]:     00027fec(j), 0002809a(j)  
+        00028006 02 20           movs       r0,#0x2
+        00028008 8d f8 14 00     strb.w     r0,[sp,#local_f4]
+        0002800c 8d f8 16 60     strb.w     r6,[sp,#local_f2]
+        00028010 06 20           movs       r0,#0x6
+        00028012 8d f8 17 00     strb.w     r0,[sp,#local_f1]
+        00028016 01 20           movs       r0,#0x1
+        00028018 3c a9           add        r1,sp,#0xf0
+        0002801a 0a 91           str        r1,[sp,#local_e0]
+        0002801c ad f8 24 00     strh.w     r0,[sp,#local_e4]
+        00028020 36 a9           add        r1,sp,#0xd8
+        00028022 8d f8 8c 00     strb.w     r0,[sp,#local_7c]
+        00028026 8d f8 90 00     strb.w     r0,[sp,#local_78]
+        0002802a 0e 91           str        r1,[sp,#local_d0]
+        0002802c a0 20           movs       r0,#0xa0
+        0002802e 27 90           str        r0,[sp,#local_6c]
+        00028030 06 f0 a0 fe     bl         FUN_0002ed74                                     undefined FUN_0002ed74()
+        00028034 90 b3           cbz        r0,LAB_0002809c
+        00028036 06 f0 91 fe     bl         FUN_0002ed5c                                     undefined FUN_0002ed5c()
+        0002803a 38 e0           b          LAB_000280ae
+                             LAB_0002803c                                    XREF[1]:     00027fe8(j)  
+        0002803c 07 f0 c6 ff     bl         FUN_0002ffcc                                     undefined FUN_0002ffcc()
+        00028040 05 22           movs       r2,#0x5
+        00028042 3a a1           adr        r1,[s_KP-01_0002812c]                            = "KP-01"
+        00028044 fe f7 89 fa     bl         FUN_0002655a                                     undefined FUN_0002655a()
+        00028048 00 b1           cbz        r0,LAB_0002804c
+        0002804a 07 25           movs       r5,#0x7
+                             LAB_0002804c                                    XREF[1]:     00028048(j)  
+        0002804c 44 f2 59 40     movw       r0,#0x4459
+        00028050 ad f8 d8 00     strh.w     r0=>LAB_00004458+1,[sp,#local_30]
+        00028054 09 20           movs       r0,#0x9
+        00028056 ad f8 dc 00     strh.w     r0,[sp,#local_2c]
+        0002805a 00 20           movs       r0,#0x0
+        0002805c 30 a9           add        r1,sp,#0xc0
+        0002805e 38 94           str        r4,[sp,#local_28]
+                             LAB_00028060                                    XREF[1]:     00028070(j)  
+        00028060 c0 f1 05 02     rsb.w      r2,r0,#0x5
+        00028064 0a 44           add        r2,r1
+        00028066 52 78           ldrb       r2,[r2,#local_42]
+        00028068 22 54           strb       r2,[r4,r0]
+        0002806a 40 1c           adds       r0,r0,#0x1
+        0002806c c0 b2           uxtb       r0,r0
+        0002806e 06 28           cmp        r0,#0x6
+        00028070 f6 d3           bcc        LAB_00028060
+        00028072 28 0a           lsrs       r0,r5,#0x8
+        00028074 a0 71           strb       r0,[r4,#0x6]
+        00028076 e5 71           strb       r5,[r4,#0x7]
+        00028078 02 f0 60 fc     bl         FUN_0002a93c                                     undefined FUN_0002a93c()
+        0002807c 00 b1           cbz        r0,LAB_00028080
+        0002807e 0a 20           movs       r0,#0xa
+                             LAB_00028080                                    XREF[1]:     0002807c(j)  
+        00028080 20 72           strb       r0,[r4,#0x8]
+        00028082 39 a8           add        r0,sp,#0xe4
+        00028084 1d 90           str        r0,[sp,#local_94]
+        00028086 44 f6 53 60     movw       r0,#0x4e53
+        0002808a ad f8 e4 00     strh.w     r0,[sp,#local_24]
+        0002808e 14 20           movs       r0,#0x14
+        00028090 ad f8 e8 00     strh.w     r0,[sp,#local_20]
+        00028094 07 f0 a6 ff     bl         FUN_0002ffe4                                     undefined FUN_0002ffe4()
+        00028098 3b 90           str        r0,[sp,#local_1c]
+        0002809a b4 e7           b          LAB_00028006
+                             LAB_0002809c                                    XREF[1]:     00028034(j)  
+        0002809c ff e7           b          LAB_0002809e
+                             LAB_0002809e                                    XREF[1]:     0002809c(j)  
+        0002809e 02 f0 4d fc     bl         FUN_0002a93c                                     undefined FUN_0002a93c()
+        000280a2 10 b1           cbz        r0,LAB_000280aa
+        000280a4 43 f2 c8 20     movw       r0,#0x32c8
+        000280a8 01 e0           b          LAB_000280ae
+                             LAB_000280aa                                    XREF[1]:     000280a2(j)  
+        000280aa 4f f4 fa 60     mov.w      r0,#0x7d0
+                             LAB_000280ae                                    XREF[2]:     0002803a(j), 000280a8(j)  
+        000280ae 28 90           str        r0=>LAB_000032c8,[sp,#local_68]
+        000280b0 20 48           ldr        r0,[DAT_00028134]                                = 000332F5h
+        000280b2 2e 90           str        r0=>LAB_000332f4+1,[sp,#local_50]
+        000280b4 05 a9           add        r1,sp,#0x14
+        000280b6 20 48           ldr        r0,[DAT_00028138]                                = 2000416Ch
+        000280b8 01 f0 a4 fa     bl         FUN_00029604                                     undefined FUN_00029604()
+        000280bc 01 21           movs       r1,#0x1
+        000280be 1e 48           ldr        r0,[DAT_00028138]                                = 2000416Ch
+        000280c0 01 f0 9b fa     bl         FUN_000295fa                                     undefined FUN_000295fa()
+        000280c4 1c 48           ldr        r0,[DAT_00028138]                                = 2000416Ch
+        000280c6 06 22           movs       r2,#0x6
+        000280c8 90 f8 54 10     ldrb.w     r1,[r0,#0x54]=>DAT_200041c0
+        000280cc 01 20           movs       r0,#0x1
+        000280ce 77 df           svc        0x77
+        000280d0 06 22           movs       r2,#0x6
+        000280d2 00 21           movs       r1,#0x0
+        000280d4 02 20           movs       r0,#0x2
+        000280d6 77 df           svc        0x77
+        000280d8 3e b0           add        sp,#0xf8
+        000280da 70 bd           pop        {r4,r5,r6,pc}
+
+
+
+
+
+                             **************************************************************
+                             *                          FUNCTION                          *
+                             **************************************************************
+                             undefined FUN_0002f9bc()
+             undefined         <UNASSIGNED>   <RETURN>
+             undefined4        Stack[-0x10]:4 local_10                                XREF[1]:     0002fae0(W)  
+                             FUN_0002f9bc                                    XREF[1]:     FUN_000340cc:0003411a(c)  
+        0002f9bc 70 b5           push       {r4,r5,r6,lr}
+        0002f9be 08 b1           cbz        r0,LAB_0002f9c4
+        0002f9c0 01 20           movs       r0,#0x1
+        0002f9c2 70 bd           pop        {r4,r5,r6,pc}
+                             LAB_0002f9c4                                    XREF[1]:     0002f9be(j)  
+        0002f9c4 1b 4c           ldr        r4,[DAT_0002fa34]                                = 20005A98h
+        0002f9c6 00 25           movs       r5,#0x0
+        0002f9c8 20 7b           ldrb       r0,[r4,#0xc]=>DAT_20005aa4
+        0002f9ca 08 b1           cbz        r0,LAB_0002f9d0
+        0002f9cc 25 73           strb       r5,[r4,#0xc]=>DAT_20005aa4
+        0002f9ce 01 e0           b          LAB_0002f9d4
+                             LAB_0002f9d0                                    XREF[1]:     0002f9ca(j)  
+        0002f9d0 00 f0 a4 f8     bl         FUN_0002fb1c                                     undefined FUN_0002fb1c()
+                             LAB_0002f9d4                                    XREF[1]:     0002f9ce(j)  
+        0002f9d4 20 78           ldrb       r0,[r4,#0x0]=>DAT_20005a98
+        0002f9d6 08 28           cmp        r0,#0x8
+        0002f9d8 2a d2           bcs        switchD_0002f9da::caseD_0
+                             switchD_0002f9da::switchD
+        0002f9da df e8 00 f0     tbb        [pc,r0]=>switchD_0002f9da::switchdataD_0002f9de  = 29h
+                             switchD_0002f9da::switchdataD_0002f9de          XREF[1]:     FUN_0002f9bc:0002f9da(*)  
+        0002f9de 29              db         29h
+        0002f9df 04              db         4h
+        0002f9e0 08              db         8h
+        0002f9e1 0c              db         Ch
+        0002f9e2 10              db         10h
+        0002f9e3 29              db         29h
+        0002f9e4 14              db         14h
+        0002f9e5 22              db         22h
+                             switchD_0002f9da::caseD_1                       XREF[1]:     0002f9da(j)  
+        0002f9e6 bd e8 70 40     pop.w      {r4,r5,r6,lr}
+        0002f9ea 00 f0 25 b8     b.w        LAB_0002fa38
+                             switchD_0002f9da::caseD_2                       XREF[1]:     0002f9da(j)  
+        0002f9ee bd e8 70 40     pop.w      {r4,r5,r6,lr}
+        0002f9f2 00 f0 81 b8     b.w        LAB_0002faf8
+                             switchD_0002f9da::caseD_3                       XREF[1]:     0002f9da(j)  
+        0002f9f6 bd e8 70 40     pop.w      {r4,r5,r6,lr}
+        0002f9fa 00 f0 63 b8     b.w        LAB_0002fac4
+                             switchD_0002f9da::caseD_4                       XREF[1]:     0002f9da(j)  
+        0002f9fe bd e8 70 40     pop.w      {r4,r5,r6,lr}
+        0002fa02 00 f0 3f b8     b.w        LAB_0002fa84
+                             switchD_0002f9da::caseD_6                       XREF[1]:     0002f9da(j)  
+        0002fa06 06 20           movs       r0,#0x6
+        0002fa08 20 70           strb       r0,[r4,#0x0]=>DAT_20005a98
+        0002fa0a 60 88           ldrh       r0,[r4,#0x2]=>DAT_20005a9a
+        0002fa0c 09 49           ldr        r1,[DAT_0002fa34]                                = 20005A98h
+        0002fa0e 00 eb 80 00     add.w      r0,r0,r0, lsl #0x2
+        0002fa12 28 39           subs       r1,#0x28
+        0002fa14 01 eb 80 00     add.w      r0,r1,r0, lsl #0x2
+        0002fa18 40 68           ldr        r0,[r0,#0x4]
+        0002fa1a bd e8 70 40     pop.w      {r4,r5,r6,lr}
+        0002fa1e 03 f0 65 bd     b.w        FUN_000334ec                                     undefined FUN_000334ec()
+                             -- Flow Override: CALL_RETURN (CALL_TERMINATOR)
+                             switchD_0002f9da::caseD_7                       XREF[1]:     0002f9da(j)  
+        0002fa22 07 20           movs       r0,#0x7
+        0002fa24 20 70           strb       r0,[r4,#0x0]=>DAT_20005a98
+        0002fa26 65 60           str        r5,[r4,#0x4]=>DAT_20005a9c
+        0002fa28 bd e8 70 40     pop.w      {r4,r5,r6,lr}
+
+
+
+
+
+                             **************************************************************
+                             *                          FUNCTION                          *
+                             **************************************************************
+                             undefined FUN_0002f43c()
+             undefined         <UNASSIGNED>   <RETURN>
+                             FUN_0002f43c
+        0002f43c 70 b5           push       {r4,r5,r6,lr}
+        0002f43e 1d 46           mov        r5,r3
+        0002f440 14 46           mov        r4,r2
+        0002f442 18 29           cmp        r1,#0x18
+        0002f444 12 d1           bne        LAB_0002f46c
+        0002f446 00 f0 cd fd     bl         FUN_0002ffe4                                     undefined FUN_0002ffe4()
+        0002f44a 00 2c           cmp        r4,#0x0
+        0002f44c 0e d0           beq        LAB_0002f46c
+        0002f44e 01 2d           cmp        r5,#0x1
+        0002f450 0c d1           bne        LAB_0002f46c
+        0002f452 22 78           ldrb       r2,[r4,#0x0]
+        0002f454 0e 4c           ldr        r4,[DAT_0002f490]                                = 20003B1Ch
+        0002f456 10 25           movs       r5,#0x10
+        0002f458 a1 79           ldrb       r1,[r4,#0x6]=>DAT_20003b22
+        0002f45a 40 5c           ldrb       r0,[r0,r1]
+        0002f45c 82 42           cmp        r2,r0
+        0002f45e 06 d0           beq        LAB_0002f46e
+        0002f460 01 22           movs       r2,#0x1
+        0002f462 0c 49           ldr        r1=>LAB_00038614,[DAT_0002f494]                  = 00038614h
+        0002f464 0a 20           movs       r0,#0xa
+        0002f466 fd f7 2f fb     bl         FUN_0002cac8                                     undefined FUN_0002cac8()
+        0002f46a a5 71           strb       r5,[r4,#0x6]=>DAT_20003b22
+                             LAB_0002f46c                                    XREF[4]:     0002f444(j), 0002f44c(j), 
+                                                                                          0002f450(j), 0002f476(j)  
+        0002f46c 70 bd           pop        {r4,r5,r6,pc}
+                             LAB_0002f46e                                    XREF[1]:     0002f45e(j)  
+        0002f46e 49 1c           adds       r1,r1,#0x1
+        0002f470 c8 b2           uxtb       r0,r1
+        0002f472 a0 71           strb       r0,[r4,#0x6]=>DAT_20003b22
+        0002f474 14 28           cmp        r0,#0x14
+        0002f476 f9 d1           bne        LAB_0002f46c
+        0002f478 01 22           movs       r2,#0x1
+        0002f47a 07 49           ldr        r1=>LAB_00038504,[DAT_0002f498]                  = 00038504h
+        0002f47c 0a 20           movs       r0,#0xa
+        0002f47e fd f7 23 fb     bl         FUN_0002cac8                                     undefined FUN_0002cac8()
+        0002f482 a5 71           strb       r5,[r4,#0x6]=>DAT_20003b22
+        0002f484 bd e8 70 40     pop.w      {r4,r5,r6,lr}
+        0002f488 19 20           movs       r0,#0x19
+        0002f48a 00 f0 0d b8     b.w        FUN_0002f4a8                                     undefined FUN_0002f4a8()
+                             -- Flow Override: CALL_RETURN (CALL_TERMINATOR)
+        0002f48e 00 00           movs       r0,r0
+                             DAT_0002f490                                    XREF[1]:     FUN_0002f43c:0002f454(R)  
+        0002f490 1c 3b 00 20     undefined4 20003B1Ch
+                             DAT_0002f494                                    XREF[1]:     FUN_0002f43c:0002f462(R)  
+        0002f494 14 86 03 00     undefined4 00038614h                                        ?  ->  00038614
+                             DAT_0002f498                                    XREF[1]:     FUN_0002f43c:0002f47a(R)  
+        0002f498 04 85 03 00     undefined4 00038504h                                        ?  ->  00038504
+                             LAB_0002f49c                                    XREF[2]:     0002f0e4(j), 0002f314(j)  
+        0002f49c 01 49           ldr        r1,[DAT_0002f4a4]                                = 20003AD8h
+        0002f49e 48 70           strb       r0,[r1,#0x1]=>DAT_20003ad9
+        0002f4a0 70 47           bx         lr
+        0002f4a2 00 00           movs       r0,r0
+                             DAT_0002f4a4                                    XREF[1]:     FUN_0002ef7c:0002f49c(R)  
+        0002f4a4 d8 3a 00 20     undefined4 20003AD8h
+                             **************************************************************
+                             *                          FUNCTION                          *
+                             **************************************************************
+                             undefined FUN_0002f4a8()
+             undefined         <UNASSIGNED>   <RETURN>
+                             FUN_0002f4a8                                    XREF[8]:     FUN_0002ef7c:0002efc8(c), 
+                                                                                          FUN_0002ef7c:0002f0d8(c), 
+                                                                                          FUN_0002ef7c:0002f0f2(c), 
+                                                                                          0002f308(c), 0002f322(c), 
+                                                                                          FUN_0002f350:0002f3cc(c), 
+                                                                                          FUN_0002f43c:0002f48a(c), 
+                                                                                          00030d92(c)  
+        0002f4a8 01 49           ldr        r1,[DAT_0002f4b0]                                = 20003AD8h
+        0002f4aa 08 70           strb       r0,[r1,#0x0]=>DAT_20003ad8
+        0002f4ac 70 47           bx         lr
+        0002f4ae 00 00           movs       r0,r0
+                             DAT_0002f4b0                                    XREF[1]:     FUN_0002f4a8:0002f4a8(R)  
+        0002f4b0 d8 3a 00 20     undefined4 20003AD8h
+                             LAB_0002f4b4                                    XREF[1]:     00028ace(j)  
+        0002f4b4 10 b5           push       {r4,lr}
+        0002f4b6 06 f0 bb fd     bl         FUN_00036030                                     undefined FUN_00036030()
+        0002f4ba 04 46           mov        r4,r0
+        0002f4bc 08 4a           ldr        r2=>LAB_0002f4e8+1,[DAT_0002f4e0]                = 0002F4E9h
+        0002f4be 02 21           movs       r1,#0x2
+        0002f4c0 08 48           ldr        r0,[DAT_0002f4e4]                                = 20003AE0h
+        0002f4c2 f9 f7 13 fb     bl         FUN_00028aec                                     undefined FUN_00028aec()
+        0002f4c6 07 49           ldr        r1,[DAT_0002f4e4]                                = 20003AE0h
+        0002f4c8 04 eb 44 00     add.w      r0,r4,r4, lsl #0x1
+        0002f4cc 0c 31           adds       r1,#0xc
+        0002f4ce 01 eb 80 00     add.w      r0,r1,r0, lsl #0x2
+        0002f4d2 14 39           subs       r1,#0x14
+        0002f4d4 48 60           str        r0,[r1,#0x4]=>DAT_20003adc
+        0002f4d6 01 68           ldr        r1,[r0,#0x0]
+        0002f4d8 bd e8 10 40     pop.w      {r4,lr}
+        0002f4dc 01 48           ldr        r0,[DAT_0002f4e4]                                = 20003AE0h
+        0002f4de 08 47           bx         r1
+                             DAT_0002f4e0                                    XREF[1]:     FUN_00028aa4:0002f4bc(R)  
+        0002f4e0 e9 f4 02 00     undefined4 0002F4E9h                                        ?  ->  0002f4e9
+                             DAT_0002f4e4                                    XREF[3]:     FUN_00028aa4:0002f4c0(R), 
+                                                                                          FUN_00028aa4:0002f4c6(R), 
+                                                                                          FUN_00028aa4:0002f4dc(R)  
+        0002f4e4 e0 3a 00 20     undefined4 20003AE0h
+                             LAB_0002f4e8+1                                  XREF[0,1]:   FUN_00028aa4:0002f4bc(*)  
+        0002f4e8 70 b5           push       {r4,r5,r6,lr}
+        0002f4ea 01 78           ldrb       r1,[r0,#0x0]
+        0002f4ec 04 46           mov        r4,r0
+        0002f4ee d2 29           cmp        r1,#0xd2
+        0002f4f0 13 d0           beq        LAB_0002f51a
+        0002f4f2 1e 48           ldr        r0,[DAT_0002f56c]                                = 20003AD8h
+        0002f4f4 1a 29           cmp        r1,#0x1a
+        0002f4f6 2d d0           beq        LAB_0002f554
+        0002f4f8 40 68           ldr        r0,[r0,#0x4]=>DAT_20003adc
+        0002f4fa 30 b1           cbz        r0,LAB_0002f50a
+        0002f4fc 45 68           ldr        r5,[r0,#0x4]
+        0002f4fe 25 b1           cbz        r5,LAB_0002f50a
+        0002f500 1a 48           ldr        r0,[DAT_0002f56c]                                = 20003AD8h
+        0002f502 a3 89           ldrh       r3,[r4,#0xc]
+        0002f504 08 30           adds       r0,#0x8
+        0002f506 a2 68           ldr        r2,[r4,#0x8]
+        0002f508 a8 47           blx        r5
+                             LAB_0002f50a                                    XREF[7]:     0002f4fa(j), 0002f4fe(j), 
+                                                                                          0002f52a(j), 0002f54a(j), 
+                                                                                          0002f55a(j), 0002f560(j), 
+                                                                                          0002f568(j)  
+        0002f50a a0 68           ldr        r0,[r4,#0x8]
+        0002f50c 00 28           cmp        r0,#0x0
+        0002f50e 03 d0           beq        LAB_0002f518
+        0002f510 00 f0 ea f8     bl         FUN_0002f6e8                                     undefined FUN_0002f6e8()
+        0002f514 00 20           movs       r0,#0x0
+        0002f516 a0 60           str        r0,[r4,#0x8]
+                             LAB_0002f518                                    XREF[1]:     0002f50e(j)  
+        0002f518 70 bd           pop        {r4,r5,r6,pc}
+
+
+
+
+
+
+                             **************************************************************
+                             *                          FUNCTION                          *
+                             **************************************************************
+                             undefined FUN_00028158()
+             undefined         <UNASSIGNED>   <RETURN>
+                             FUN_00028158                                    XREF[2]:     FUN_0002be60:0002beac(c), 
+                                                                                          FUN_0002fba4:0002fbd2(c)  
+        00028158 2d e9 f0 47     push       {r4,r5,r6,r7,r8,r9,r10,lr}
+        0002815c 0e 46           mov        r6,r1
+        0002815e 07 46           mov        r7,r0
+        00028160 98 46           mov        r8,r3
+        00028162 15 46           mov        r5,r2
+        00028164 2c 49           ldr        r1=>LAB_00028220+1,[DAT_00028218]                = 00028221h
+        00028166 42 f2 10 70     movw       r0,#LAB_00002710
+        0002816a 08 9c           ldr        r4,[sp,#Stack[0x0]]
+        0002816c 00 f0 5e f8     bl         FUN_0002822c                                     undefined FUN_0002822c()
+        00028170 00 28           cmp        r0,#0x0
+        00028172 11 d1           bne        LAB_00028198
+        00028174 b8 f1 00 0f     cmp.w      r8,#0x0
+        00028178 b0 46           mov        r8,r6
+        0002817a ba 46           mov        r10,r7
+        0002817c a9 46           mov        r9,r5
+        0002817e 20 46           mov        r0,r4
+        00028180 0c d0           beq        LAB_0002819c
+        00028182 08 f0 b3 ff     bl         FUN_000310ec                                     undefined FUN_000310ec()
+        00028186 06 46           mov        r6,r0
+        00028188 20 07           lsls       r0,r4,#0x1c
+        0002818a 28 d0           beq        LAB_000281de
+                             LAB_0002818c                                    XREF[3]:     000281a4(j), 000281dc(j), 
+                                                                                          00028214(j)  
+        0002818c 30 46           mov        r0,r6
+        0002818e 07 f0 83 fa     bl         FUN_0002f698                                     undefined FUN_0002f698()
+        00028192 22 49           ldr        r1,[DAT_0002821c]                                = 20003B4Ch
+        00028194 00 20           movs       r0,#0x0
+        00028196 08 70           strb       r0,[r1,#0x0]=>DAT_20003b4c
+                             LAB_00028198                                    XREF[1]:     00028172(j)  
+        00028198 bd e8 f0 87     pop.w      {r4,r5,r6,r7,r8,r9,r10,pc}
+                             LAB_0002819c                                    XREF[1]:     00028180(j)  
+        0002819c 08 f0 a6 ff     bl         FUN_000310ec                                     undefined FUN_000310ec()
+        000281a0 06 46           mov        r6,r0
+        000281a2 20 07           lsls       r0,r4,#0x1c
+        000281a4 f2 d1           bne        LAB_0002818c
+        000281a6 21 46           mov        r1,r4
+        000281a8 30 46           mov        r0,r6
+        000281aa fe f7 c4 f9     bl         FUN_00026536                                     undefined FUN_00026536()
+        000281ae 22 46           mov        r2,r4
+        000281b0 41 46           mov        r1,r8
+        000281b2 30 46           mov        r0,r6
+        000281b4 fe f7 a6 f9     bl         FUN_00026504                                     undefined FUN_00026504()
+        000281b8 00 25           movs       r5,#0x0
+        000281ba 0d e0           b          LAB_000281d8
+                             LAB_000281bc                                    XREF[1]:     000281da(j)  
+        000281bc 77 19           adds       r7,r6,r5
+        000281be 08 eb 05 00     add.w      r0,r8,r5
+        000281c2 3a 46           mov        r2,r7
+        000281c4 51 46           mov        r1,r10
+        000281c6 fe f7 0b fc     bl         FUN_000269e0                                     undefined FUN_000269e0()
+        000281ca 39 46           mov        r1,r7
+        000281cc 09 eb 05 00     add.w      r0,r9,r5
+        000281d0 10 22           movs       r2,#0x10
+        000281d2 fe f7 97 f9     bl         FUN_00026504                                     undefined FUN_00026504()
+        000281d6 10 35           adds       r5,#0x10
+                             LAB_000281d8                                    XREF[1]:     000281ba(j)  
+        000281d8 a5 42           cmp        r5,r4
+        000281da ef d3           bcc        LAB_000281bc
+        000281dc d6 e7           b          LAB_0002818c
+                             LAB_000281de                                    XREF[1]:     0002818a(j)  
+        000281de 21 46           mov        r1,r4
+        000281e0 30 46           mov        r0,r6
+        000281e2 fe f7 a8 f9     bl         FUN_00026536                                     undefined FUN_00026536()
+        000281e6 22 46           mov        r2,r4
+        000281e8 41 46           mov        r1,r8
+        000281ea 30 46           mov        r0,r6
+        000281ec fe f7 8a f9     bl         FUN_00026504                                     undefined FUN_00026504()
+        000281f0 00 25           movs       r5,#0x0
+        000281f2 0d e0           b          LAB_00028210
+                             LAB_000281f4                                    XREF[1]:     00028212(j)  
+        000281f4 77 19           adds       r7,r6,r5
+        000281f6 08 eb 05 00     add.w      r0,r8,r5
+        000281fa 3a 46           mov        r2,r7
+        000281fc 51 46           mov        r1,r10
+        000281fe fe f7 dd fb     bl         FUN_000269bc                                     undefined FUN_000269bc()
+        00028202 39 46           mov        r1,r7
+        00028204 09 eb 05 00     add.w      r0,r9,r5
+        00028208 10 22           movs       r2,#0x10
+        0002820a fe f7 7b f9     bl         FUN_00026504                                     undefined FUN_00026504()
+        0002820e 10 35           adds       r5,#0x10
+                             LAB_00028210                                    XREF[1]:     000281f2(j)  
+        00028210 a5 42           cmp        r5,r4
+        00028212 ef d3           bcc        LAB_000281f4
+        00028214 ba e7           b          LAB_0002818c
+        00028216 00 00           movs       r0,r0
+                             DAT_00028218                                    XREF[1]:     FUN_00028158:00028164(R)  
+        00028218 21 82 02 00     undefined4 00028221h                                        ?  ->  00028221
+                             DAT_0002821c                                    XREF[1]:     FUN_00028158:00028192(R)  
+        0002821c 4c 3b 00 20     undefined4 20003B4Ch
+                             LAB_00028220+1                                  XREF[0,1]:   FUN_00028158:00028164(*)  
+        00028220 01 49           ldr        r1,[DAT_00028228]                                = 20003B4Ch
+        00028222 01 20           movs       r0,#0x1
+        00028224 08 70           strb       r0,[r1,#0x0]=>DAT_20003b4c
+        00028226 70 47           bx         lr
+                             DAT_00028228                                    XREF[1]:     00028220(R)  
+        00028228 4c 3b 00 20     undefined4 20003B4Ch
+

@@ -1,0 +1,131 @@
+
+void FUN_00033508(void)
+
+{
+  FUN_00031bf0(DAT_00033528,*DAT_00033520,DAT_00033524,8,0);
+  return;
+}
+
+
+
+
+undefined4 FUN_00031a14(int *param_1,uint param_2,int param_3,undefined4 param_4)
+
+{
+  int iVar1;
+  undefined4 uVar2;
+  
+  if (param_1 == (int *)0x0) {
+    uVar2 = 0xe;
+  }
+  else if (*param_1 == 0) {
+    uVar2 = 8;
+  }
+  else if (param_3 == 0) {
+    uVar2 = 9;
+  }
+  else {
+    if (((*(int *)param_1[1] - 1U & param_2) == 0) &&
+       (iVar1 = FUN_00027f64(param_1,param_2,param_3 * *(int *)param_1[1]), iVar1 != 0)) {
+                    /* WARNING: Could not recover jumptable at 0x00031a4e. Too many branches */
+                    /* WARNING: Treating indirect jump as call */
+      uVar2 = (**(code **)(*param_1 + 0x10))(param_1,param_2,param_3,param_4);
+      return uVar2;
+    }
+    uVar2 = 0x10;
+  }
+  return uVar2;
+}
+
+
+
+
+undefined4 FUN_000302b8(short *param_1,short *param_2)
+
+{
+  if (param_2 < param_1 + (uint)(ushort)param_1[1] * 2 + 6) {
+    return 2;
+  }
+  if ((param_1[2] != -1) && (*param_1 != 0)) {
+    return 0;
+  }
+  return 1;
+}
+
+
+
+
+
+
+undefined4 FUN_000302de(int *param_1,int *param_2)
+
+{
+  if ((param_1 < param_2) && (*param_1 != -1)) {
+    return 1;
+  }
+  return 0;
+}
+
+
+
+
+
+                             DAT_00033500                                    XREF[1]:     FUN_000334ec:000334f6(R)  
+        00033500 f8 8d 03 00     undefined4 00038DF8h                                        ?  ->  00038df8
+
+
+void FUN_00033508(void)
+
+{
+  FUN_00031bf0(DAT_00033528,*DAT_00033520,DAT_00033524,8,0);
+  return;
+}
+
+
+
+
+                             DAT_00033504                                    XREF[1]:     FUN_000334ec:000334f8(R)  
+        00033504 40 3f 00 20     undefined4 20003F40h
+
+
+
+void FUN_00033508(void)
+
+{
+  FUN_00031bf0(DAT_00033528,*DAT_00033520,DAT_00033524,8,0);
+  return;
+}
+
+
+
+
+                             DAT_0002ffd4                                    XREF[1]:     FUN_0002ffcc:0002ffcc(R)  
+        0002ffd4 50 3d 00 20     undefined4 20003D50h
+
+
+
+void FUN_00033508(void)
+
+{
+  FUN_00031bf0(DAT_00033528,*DAT_00033520,DAT_00033524,8,0);
+  return;
+}
+
+
+
+
+
+                             DAT_0002ffec                                    XREF[1]:     FUN_0002ffe4:0002ffe4(R)  
+        0002ffec 50 3d 00 20     undefined4 20003D50h
+
+
+
+
+void FUN_00033508(void)
+
+{
+  FUN_00031bf0(DAT_00033528,*DAT_00033520,DAT_00033524,8,0);
+  return;
+}
+
+
