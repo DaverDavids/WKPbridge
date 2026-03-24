@@ -3,10 +3,14 @@
 //
 // Fix log:
 //  r1-r5: scan/connect fixes, debug
-//  r6: Dump full manufacturer data bytes from advertisement.
-//      Wyze keypad adv mfr data byte[8] = 0x0A if paired, 0x00 if unpaired.
-//      Also: on connect failure, log exact HCI status code from
-//      onConnectFail reason (this is the raw HCI error, not ble_hs wrapping).
+//  r6: Dump full manufacturer data bytes; on connect failure log HCI status.
+//  r7: Correct Wyze service/char UUIDs (0xFE50/FE51/FE52).
+//      Added all known Wyze ad names (KP-01, DingDing, Wyze Lock, DD-Fact).
+//      Named packet presets: Bind, Unlock, Test-Keypress.
+//      Full GATT dump on connect: all services + characteristics + properties.
+//      Richer mfr data decode (device type, pairing/lock status, MAC).
+//      Added /api/sendBind, /api/sendUnlock, /api/sendKP endpoints.
+//      Connection params logged. Log buffer expanded to 24KB.
 
 #define DEBUG_SERIAL 1
 
@@ -28,10 +32,28 @@ static const char *HOSTNAME = "WKPbridge";
 static const char *AP_SSID  = "WKPbridge-setup";
 static const byte DNS_PORT  = 53;
 
-static const char *NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-static const char *NUS_RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
-static const char *NUS_TX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
-static const uint16_t WYZE_COMPANY_ID = 0x4459;
+// ---- Wyze UUIDs (from firmware decompile) --------------------------------
+// The WLCKKP1 uses a custom service 0xFE50 (16-bit short form)
+// Write to FE51, notifications from FE52
+static const char *WYZE_SERVICE_UUID  = "0000fe50-0000-1000-8000-00805f9b34fb";
+static const char *WYZE_WRITE_UUID    = "0000fe51-0000-1000-8000-00805f9b34fb";
+static const char *WYZE_NOTIFY_UUID   = "0000fe52-0000-1000-8000-00805f9b34fb";
+
+// Legacy NUS UUIDs (kept as fallback if user overrides)
+static const char *NUS_SERVICE_UUID   = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+static const char *NUS_RX_UUID        = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+static const char *NUS_TX_UUID        = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+static const uint16_t WYZE_COMPANY_ID = 0x4459;  // 'DY' little-endian
+
+// Known Wyze keypad advertisement names from firmware strings
+static const char * const WYZE_ADV_NAMES[] = {
+  "Wyze Lock",   // bound to lock
+  "DingDing",    // alt bound name
+  "KP-01",       // normal / unbound
+  "DD-Fact",     // factory mode
+  nullptr
+};
 
 #if DEBUG_SERIAL
   #define DBG_BEGIN(x)    Serial.begin(x)
@@ -106,8 +128,21 @@ NimBLEClient               *bleClient = nullptr;
 NimBLERemoteCharacteristic *writeChr  = nullptr;
 NimBLERemoteCharacteristic *notifyChr = nullptr;
 
-static const uint8_t PKT_FF[8] = {0xDE,0xC0,0xAD,0xDE,0xFF,0x01,0x1E,0xF1};
-static const uint8_t PKT_FE[8] = {0xDE,0xC0,0xAD,0xDE,0xFE,0x01,0x1E,0xF1};
+// ---- Packet presets (from firmware reverse-engineering) ------------------
+// Header: DE C0 AD DE
+// Byte[4] = command opcode
+//   0xFF = probe/identify
+//   0xFE = probe variant
+//   0x01 = bind request
+//   0x00 = unlock
+//   0x02 = keypress test
+// Byte[5] = sub-command / payload length
+// Bytes[6-7] = 0x1E F1 (checksum placeholder - may need real checksum)
+static const uint8_t PKT_FF[8]   = {0xDE,0xC0,0xAD,0xDE,0xFF,0x01,0x1E,0xF1}; // probe
+static const uint8_t PKT_FE[8]   = {0xDE,0xC0,0xAD,0xDE,0xFE,0x01,0x1E,0xF1}; // probe alt
+static const uint8_t PKT_BIND[8] = {0xDE,0xC0,0xAD,0xDE,0x01,0x1E,0xF1,0x00}; // bind
+static const uint8_t PKT_UNLOCK[8]= {0xDE,0xC0,0xAD,0xDE,0x00,0x01,0x1E,0xF1}; // unlock
+static const uint8_t PKT_KP[8]   = {0xDE,0xC0,0xAD,0xDE,0x02,0x01,0x1E,0xF1}; // keypress
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -126,7 +161,7 @@ String jsonEscape(const String &in) {
 }
 void addLog(const String &line){
   String s=String(millis())+" | "+line; logBuffer+=s+"\n";
-  if(logBuffer.length()>14000)logBuffer.remove(0,logBuffer.length()-14000);
+  if(logBuffer.length()>24000)logBuffer.remove(0,logBuffer.length()-24000);
   DBG_PRINTLN(s);
 }
 String bytesToHex(const uint8_t *d,size_t l){
@@ -159,9 +194,10 @@ void loadSettings(){
   settings.bleAddress  =prefs.getString("ble_addr", "");
   settings.bleAddrType =prefs.getString("ble_atype","random");
   settings.bleName     =prefs.getString("ble_name", "Wyze Lock");
-  settings.serviceUuid =prefs.getString("svc_uuid", NUS_SERVICE_UUID);
-  settings.writeUuid   =prefs.getString("wr_uuid",  NUS_RX_UUID);
-  settings.notifyUuid  =prefs.getString("nt_uuid",  NUS_TX_UUID);
+  // Default to Wyze-specific UUIDs from firmware
+  settings.serviceUuid =prefs.getString("svc_uuid", WYZE_SERVICE_UUID);
+  settings.writeUuid   =prefs.getString("wr_uuid",  WYZE_WRITE_UUID);
+  settings.notifyUuid  =prefs.getString("nt_uuid",  WYZE_NOTIFY_UUID);
   settings.autoConnect      =prefs.getBool  ("auto_conn",false);
   settings.writeWithResponse=prefs.getBool  ("wr_rsp",   false);
   settings.scanSeconds      =prefs.getUChar ("scan_sec", 5);
@@ -213,12 +249,18 @@ class ClientCB : public NimBLEClientCallbacks {
 public:
   void onConnect(NimBLEClient *c) override {
     addLog("BLE onConnect: "+String(c->getPeerAddress().toString().c_str()));
+    // Log connection parameters
+    ble_gap_conn_desc desc;
+    if(ble_gap_conn_find(c->getConnId(), &desc) == 0) {
+      addLog("  connParams itvl=" + String(desc.conn_itvl) +
+             " latency=" + String(desc.conn_latency) +
+             " supervision=" + String(desc.supervision_timeout) +
+             " ownAddrType=" + String(desc.our_id_addr.type) +
+             " peerAddrType=" + String(desc.peer_id_addr.type));
+    }
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
   void onConnectFail(NimBLEClient *c, int reason) override {
-    // reason here is the raw HCI status code (not ble_hs wrapped)
-    // Common HCI statuses: 0x3B=connection rejected due to limited resources,
-    // 0x05=auth failure, 0x3A=controller busy, 0x02=unknown conn ID
     addLog("BLE onConnectFail HCI=0x"+String(reason,HEX)
            +" nimble=0x"+String(c->getLastError(),HEX)
            +" ("+String(nimbleErrStr(c->getLastError()))+")");
@@ -235,7 +277,25 @@ public:
 ClientCB gClientCB;
 
 void notifyCB(NimBLERemoteCharacteristic *c,uint8_t *d,size_t l,bool n){
-  (void)c;(void)n;lastRxHex=bytesToHex(d,l);addLog("RX: "+lastRxHex);mqttPublish(lastRxHex);
+  String chrUuid = String(c->getUUID().toString().c_str());
+  lastRxHex=bytesToHex(d,l);
+  addLog("RX [" + chrUuid + "]: " + lastRxHex);
+  // Attempt basic opcode decode
+  if(l >= 5 && d[0]==0xDE && d[1]==0xC0 && d[2]==0xAD && d[3]==0xDE) {
+    uint8_t op = d[4];
+    String opName;
+    switch(op) {
+      case 0x00: opName="UNLOCK_RESP"; break;
+      case 0x01: opName="BIND_RESP"; break;
+      case 0x02: opName="KEYPRESS_RESP"; break;
+      case 0xFE: opName="PROBE_RESP_FE"; break;
+      case 0xFF: opName="PROBE_RESP_FF"; break;
+      default: opName="OP_0x"+String(op,HEX); break;
+    }
+    addLog("  -> Wyze pkt op=" + opName + " payload[" + String(l-5) + "]="
+           + (l>5 ? bytesToHex(d+5, l-5) : "(none)"));
+  }
+  mqttPublish(lastRxHex);
 }
 void deleteBleClient(){
   if(bleClient){if(bleClient->isConnected())bleClient->disconnect();NimBLEDevice::deleteClient(bleClient);bleClient=nullptr;}
@@ -244,15 +304,48 @@ void deleteBleClient(){
 bool isBleReady(){return bleClient&&bleClient->isConnected()&&writeChr;}
 
 // --------------------------------------------------------------------------
+// Full GATT dump: log all services + characteristics + properties
+// --------------------------------------------------------------------------
+void dumpAllGatt() {
+  if(!bleClient||!bleClient->isConnected()) return;
+  addLog("=== GATT DUMP START ===");
+  const std::vector<NimBLERemoteService*> &svcs = bleClient->getServices(true);
+  addLog("  Service count: " + String(svcs.size()));
+  for(NimBLERemoteService *svc : svcs) {
+    String svcUuid = String(svc->getUUID().toString().c_str());
+    addLog("  SVC: " + svcUuid);
+    const std::vector<NimBLERemoteCharacteristic*> *chars = svc->getCharacteristics(true);
+    if(!chars) continue;
+    for(NimBLERemoteCharacteristic *ch : *chars) {
+      String props = "";
+      if(ch->canRead())            props += "R";
+      if(ch->canWrite())           props += "W";
+      if(ch->canWriteNoResponse()) props += "w";
+      if(ch->canNotify())          props += "N";
+      if(ch->canIndicate())        props += "I";
+      if(ch->canBroadcast())       props += "B";
+      String val = "";
+      if(ch->canRead()) {
+        std::string rv = ch->readValue();
+        if(rv.size()>0) val = " val=" + bytesToHex((const uint8_t*)rv.data(), rv.size());
+      }
+      addLog("    CHR: " + String(ch->getUUID().toString().c_str())
+             + " props=[" + props + "]" + val);
+    }
+  }
+  addLog("=== GATT DUMP END ===");
+}
+
+// --------------------------------------------------------------------------
 // Parse and log Wyze manufacturer data
 // Wyze mfr data layout (after 2-byte company ID 0x4459):
-//   [0-1] = company ID (0x59, 0x44)
-//   [2]   = data type?
-//   [3]   = length?
-//   [4-9] = MAC address (reversed)
-//   [10]  = gateway type (0x07 = KP-01)
-//   [11]  = pairing status (0x0A = paired, 0x00 = unpaired)
-//   [12]  = lock status?
+//   [0-1] = company ID bytes (0x59, 0x44)
+//   [2]   = data type / protocol version
+//   [3]   = payload length
+//   [4-9] = MAC address of keypad (in reverse BLE byte order)
+//   [10]  = device type: 0x07 = KP-01 keypad
+//   [11]  = pairing/bind status: 0x0A = paired to lock, 0x00 = unpaired
+//   [12]  = lock state: 0x00 = locked, 0x01 = unlocked (when paired)
 // --------------------------------------------------------------------------
 void logWyzeMfrData(const NimBLEAdvertisedDevice *dev) {
   if(!dev->haveManufacturerData()) return;
@@ -266,23 +359,52 @@ void logWyzeMfrData(const NimBLEAdvertisedDevice *dev) {
     if(i+1<len) hex+=' ';
   }
   addLog("  Wyze mfr data ("+String(len)+" bytes): "+hex);
+
+  if(len > 3) {
+    addLog("  -> protocol=0x"+String((uint8_t)m[2],HEX)+" payloadLen="+String((uint8_t)m[3]));
+  }
+  if(len >= 10) {
+    // MAC is bytes [4..9] in reverse
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             (uint8_t)m[9],(uint8_t)m[8],(uint8_t)m[7],
+             (uint8_t)m[6],(uint8_t)m[5],(uint8_t)m[4]);
+    addLog("  -> embedded MAC: " + String(macStr));
+  }
+  if(len > 10) {
+    uint8_t devType = (uint8_t)m[10];
+    String dtName = devType==0x07 ? "KP-01" : ("0x"+String(devType,HEX));
+    addLog("  -> devType=" + dtName);
+  }
   if(len > 11) {
-    uint8_t devType    = (uint8_t)m[10];
     uint8_t pairStatus = (uint8_t)m[11];
-    addLog("  -> devType=0x"+String(devType,HEX)
-           +" pairStatus=0x"+String(pairStatus,HEX)
+    addLog("  -> pairStatus=0x"+String(pairStatus,HEX)
            +" ("+String(pairStatus==0x0A?"PAIRED":pairStatus==0x00?"UNPAIRED":"UNKNOWN")+")");
   }
   if(len > 12) {
-    addLog("  -> byte[12]=0x"+String((uint8_t)m[12],HEX));
+    uint8_t lockState = (uint8_t)m[12];
+    addLog("  -> lockState=0x"+String(lockState,HEX)
+           +" ("+String(lockState==0x01?"UNLOCKED":lockState==0x00?"LOCKED":"UNKNOWN")+")");
+  }
+  if(len > 13) {
+    addLog("  -> extra bytes[13+]: " + bytesToHex((const uint8_t*)m.data()+13, len-13));
   }
 }
 
 bool isWyzeDevice(const NimBLEAdvertisedDevice *dev){
-  if(!dev->haveManufacturerData())return false;
-  const std::string &m=dev->getManufacturerData();
-  if(m.size()<2)return false;
-  return ((uint8_t)m[0]|((uint8_t)m[1]<<8))==WYZE_COMPANY_ID;
+  // Match by manufacturer data company ID
+  if(dev->haveManufacturerData()) {
+    const std::string &m=dev->getManufacturerData();
+    if(m.size()>=2 && (((uint8_t)m[0]|((uint8_t)m[1]<<8))==WYZE_COMPANY_ID)) return true;
+  }
+  // Also match by known advertisement names
+  if(dev->haveName()) {
+    std::string name = dev->getName();
+    for(int i=0; WYZE_ADV_NAMES[i]!=nullptr; i++) {
+      if(name == WYZE_ADV_NAMES[i]) return true;
+    }
+  }
+  return false;
 }
 
 // --------------------------------------------------------------------------
@@ -298,7 +420,7 @@ bool doScanFindTarget(uint8_t secs,const String &targetUpper){
   scan->setActiveScan(true);
   scan->setInterval(40);scan->setWindow(40);scan->setDuplicateFilter(false);
 
-  addLog("BLE scan "+String(secs)+"s");
+  addLog("BLE scan "+String(secs)+"s (looking for: Wyze Lock / DingDing / KP-01 / DD-Fact or addr=" + (targetUpper.isEmpty()?"any":targetUpper) + ")");
   NimBLEScanResults results=scan->getResults((uint32_t)secs*1000,false);
   addLog("Scan done: "+String(results.getCount())+" device(s)");
 
@@ -319,8 +441,15 @@ bool doScanFindTarget(uint8_t secs,const String &targetUpper){
 
     addLog("  "+addrUp+" type="+String(at)+" ["+ats+"] '"+name+"' rssi="+String(rssi)+(wyze?" [Wyze]":"")+" raw="+bytesToHex(rawBytes,6));
 
-    // Dump full Wyze manufacturer data for analysis
+    // Full Wyze manufacturer data decode
     if(wyze) logWyzeMfrData(dev);
+
+    // Log all service UUIDs advertised
+    if(dev->haveServiceUUID()) {
+      for(int si=0; si<(int)dev->getServiceUUIDCount(); si++) {
+        addLog("    AdvSvcUUID: " + String(dev->getServiceUUID(si).toString().c_str()));
+      }
+    }
 
     if(!first)json+=",";first=false;
     json+="{\"addr\":\""+jsonEscape(addrStr)+"\",\"addrType\":\""+ats+"\",\"name\":\""+jsonEscape(name)+"\",\"rssi\":"+String(rssi)+",\"wyze\":"+String(wyze?"true":"false")+"}";
@@ -329,11 +458,19 @@ bool doScanFindTarget(uint8_t secs,const String &targetUpper){
     bool nameMatch=!found&&settings.bleName.length()&&name.length()&&[&](){
       String n1=name;n1.toLowerCase();String n2=settings.bleName;n2.toLowerCase();return n1.indexOf(n2)>=0;
     }();
+    // Also match any known Wyze name
+    bool wyzeNameMatch = false;
+    if(!found && dev->haveName()) {
+      std::string dn = dev->getName();
+      for(int ni=0; WYZE_ADV_NAMES[ni]!=nullptr; ni++) {
+        if(dn == WYZE_ADV_NAMES[ni]) { wyzeNameMatch=true; break; }
+      }
+    }
 
-    if(!found&&(addrMatch||nameMatch||(wyze&&!found))){
+    if(!found&&(addrMatch||nameMatch||wyzeNameMatch||(wyze&&!found))){
       memcpy(gFoundAddrBytes,rawBytes,6);
       gFoundAddrType=at;found=true;
-      String reason=addrMatch?"addr":nameMatch?"name":"wyze-mfr";
+      String reason=addrMatch?"addr":nameMatch?"name-filter":wyzeNameMatch?"wyze-adv-name":"wyze-mfr-id";
       addLog("  -> "+reason+" match | saved bytes="+bytesToHex(gFoundAddrBytes,6)+" type="+String(at));
       if(!addrMatch)currentTargetAddr=addrStr;
     }
@@ -411,44 +548,61 @@ bool connectBle(){
   addLog("MTU="+String(bleClient->getMTU()));
   bleClient->updateConnParams(12,12,0,200);
 
-  addLog("Discovering services...");
+  // ---- Full GATT dump for protocol analysis ----
+  dumpAllGatt();
+
+  // ---- Locate target service ----
+  addLog("Locating service: "+settings.serviceUuid);
   NimBLERemoteService *svc=bleClient->getService(NimBLEUUID(settings.serviceUuid.c_str()));
   if(!svc){
     addLog("Service not found: "+settings.serviceUuid);
-    const std::vector<NimBLERemoteService*>&svcs=bleClient->getServices(true);
-    for(NimBLERemoteService *s:svcs)addLog("  Avail: "+String(s->getUUID().toString().c_str()));
-    deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;
+    // Try short-form fallback for 0xFE50
+    if(settings.serviceUuid == WYZE_SERVICE_UUID) {
+      addLog("Trying short UUID 0xFE50...");
+      svc = bleClient->getService(NimBLEUUID((uint16_t)0xFE50));
+    }
+    if(!svc) {
+      addLog("Service still not found. Check GATT dump above.");
+      deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;
+    }
   }
-  addLog("Service found");
+  addLog("Service found: "+String(svc->getUUID().toString().c_str()));
 
   writeChr=svc->getCharacteristic(NimBLEUUID(settings.writeUuid.c_str()));
+  if(!writeChr) {
+    // Try short form
+    writeChr=svc->getCharacteristic(NimBLEUUID((uint16_t)0xFE51));
+  }
   if(!writeChr){addLog("Write chr not found");deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;}
-  addLog("Write chr ok canWrite="+String((writeChr->canWrite()||writeChr->canWriteNoResponse())?"yes":"no"));
+  addLog("Write chr: "+String(writeChr->getUUID().toString().c_str())
+         +" canWrite="+String((writeChr->canWrite()||writeChr->canWriteNoResponse())?"yes":"no"));
 
   if(settings.notifyUuid.length()){
     notifyChr=svc->getCharacteristic(NimBLEUUID(settings.notifyUuid.c_str()));
+    if(!notifyChr) notifyChr=svc->getCharacteristic(NimBLEUUID((uint16_t)0xFE52));
     if(notifyChr&&(notifyChr->canNotify()||notifyChr->canIndicate())){
-      if(notifyChr->subscribe(true,notifyCB))addLog("Notify subscribed");
+      if(notifyChr->subscribe(true,notifyCB))addLog("Notify subscribed: "+String(notifyChr->getUUID().toString().c_str()));
       else addLog("Notify subscribe failed");
     }else addLog("Notify chr not subscribable");
   }
 
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
-  addLog("BLE ready");
+  addLog("BLE ready - send Probe (FF) first, watch RX for response");
   return true;
 }
 
 void disconnectBle(){deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);addLog("BLE disconnected");}
 
 bool sendPacket(const uint8_t *d,size_t l,const char *tag){
-  if(!isBleReady()){addLog(String("TX failed: ")+tag);return false;}
+  if(!isBleReady()){addLog(String("TX failed: BLE not ready - ")+tag);return false;}
   lastTxHex=bytesToHex(d,l);addLog(String("TX ")+tag+": "+lastTxHex);
   bool ok=writeChr->writeValue(d,l,settings.writeWithResponse);
-  addLog(String("TX ")+tag+": "+(ok?"OK":"FAIL"));return ok;
+  addLog(String("TX ")+tag+": "+(ok?"OK":"FAIL (check writeWithResponse setting)"));
+  return ok;
 }
 bool sendRawHex(const String &hex){
   std::vector<uint8_t> buf;
-  if(!parseHexString(hex,buf)){addLog("Hex parse failed");return false;}
+  if(!parseHexString(hex,buf)){addLog("Hex parse failed: '"+hex+"'");return false;}
   return sendPacket(buf.data(),buf.size(),"RAW");
 }
 
@@ -510,11 +664,15 @@ void handleSaveWifi(){settings.wifiSsid=server.arg("ssid");settings.wifiPsk=serv
 void handleClearBonds(){NimBLEDevice::deleteAllBonds();addLog("Bonds cleared");sendOk("Bonds cleared");}
 void handleConnect()   {connectBle()  ?sendOk("BLE connected"):sendErr("Failed - check log");}
 void handleDisconnect(){disconnectBle();sendOk("Disconnected");}
-void handleSendFF()    {sendPacket(PKT_FF,sizeof(PKT_FF),"FF")?sendOk("FF sent"):sendErr("FF failed");}
-void handleSendFE()    {sendPacket(PKT_FE,sizeof(PKT_FE),"FE")?sendOk("FE sent"):sendErr("FE failed");}
+void handleSendFF()    {sendPacket(PKT_FF,   sizeof(PKT_FF),   "PROBE_FF")?sendOk("Probe FF sent"):sendErr("FF failed - not connected?");}
+void handleSendFE()    {sendPacket(PKT_FE,   sizeof(PKT_FE),   "PROBE_FE")?sendOk("Probe FE sent"):sendErr("FE failed - not connected?");}
+void handleSendBind()  {sendPacket(PKT_BIND, sizeof(PKT_BIND), "BIND")?sendOk("Bind sent"):sendErr("Bind failed - not connected?");}
+void handleSendUnlock(){sendPacket(PKT_UNLOCK,sizeof(PKT_UNLOCK),"UNLOCK")?sendOk("Unlock sent"):sendErr("Unlock failed - not connected?");}
+void handleSendKP()    {sendPacket(PKT_KP,   sizeof(PKT_KP),   "KEYPRESS")?sendOk("Keypress sent"):sendErr("Keypress failed - not connected?");}
 void handleSendRaw()   {sendRawHex(server.arg("hex"))?sendOk("Raw sent"):sendErr("Raw failed");}
 void handleClearLog()  {logBuffer="";lastTxHex="";lastRxHex="";sendOk("Log cleared");}
 void handleReboot()    {sendOk("Rebooting");delay(200);ESP.restart();}
+void handleGattDump()  {dumpAllGatt();sendOk("GATT dump in log");}
 
 void setupWeb(){
   server.on("/",HTTP_GET,handleRoot);server.on("/api/state",HTTP_GET,handleState);
@@ -522,8 +680,11 @@ void setupWeb(){
   server.on("/api/saveConfig",HTTP_POST,handleSaveConfig);server.on("/api/saveWifi",HTTP_POST,handleSaveWifi);
   server.on("/api/connect",HTTP_POST,handleConnect);      server.on("/api/disconnect",HTTP_POST,handleDisconnect);
   server.on("/api/sendFF",HTTP_POST,handleSendFF);        server.on("/api/sendFE",HTTP_POST,handleSendFE);
+  server.on("/api/sendBind",HTTP_POST,handleSendBind);    server.on("/api/sendUnlock",HTTP_POST,handleSendUnlock);
+  server.on("/api/sendKP",HTTP_POST,handleSendKP);
   server.on("/api/sendRaw",HTTP_POST,handleSendRaw);      server.on("/api/clearLog",HTTP_POST,handleClearLog);
   server.on("/api/clearBonds",HTTP_POST,handleClearBonds);server.on("/api/reboot",HTTP_POST,handleReboot);
+  server.on("/api/gattDump",HTTP_POST,handleGattDump);
   server.onNotFound([](){if(portalMode){server.sendHeader("Location","/",true);server.send(302,"text/plain","");}else server.send(404,"text/plain","Not found");});
   server.begin();addLog("HTTP server started");
 }
@@ -542,16 +703,18 @@ void serviceBleAutoConnect(){
 }
 
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r7");
   loadSettings();
   addLog("addr="+settings.bleAddress+" storedType="+settings.bleAddrType);
-  addLog("svc="+settings.serviceUuid+" wr="+settings.writeUuid);
+  addLog("svc="+settings.serviceUuid);
+  addLog("wr="+settings.writeUuid);
+  addLog("nt="+settings.notifyUuid);
   WiFi.disconnect(true,true);delay(200);
   beginWiFi(false);
   NimBLEDevice::init("");
   NimBLEDevice::setPower(9);
   NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
-  addLog("Own addr: "+String(NimBLEDevice::getAddress().toString().c_str()));
+  addLog("Own BLE addr: "+String(NimBLEDevice::getAddress().toString().c_str()));
   NimBLEDevice::setSecurityAuth(0);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
