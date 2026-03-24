@@ -18,6 +18,11 @@
 //       10 -> 500 (=5s). Add post-scan settle delay (500ms) + coex settle (100ms)
 //       before connect. Increase inter-attempt delay 200->400ms to avoid EALREADY
 //       race with stale onDisconnect. dumpAllGatt() logs when not connected.
+//  r7d: Fix EALREADY false-negative: after connect() returns false, check isConnected()
+//       before declaring failure -- EALREADY can occur when connection actually succeeded
+//       at controller level. Calling deleteBleClient() in that case sends a disconnect
+//       to the keypad (0x216 = local host terminated), causing error beep + exit pairing.
+//       Added extensive debug logging throughout connect/callback path.
 
 #define DEBUG_SERIAL 1
 
@@ -40,8 +45,6 @@ static const char *AP_SSID  = "WKPbridge-setup";
 static const byte DNS_PORT  = 53;
 
 // ---- Wyze UUIDs (from firmware decompile) --------------------------------
-// The WLCKKP1 uses a custom service 0xFE50 (16-bit short form)
-// Write to FE51, notifications from FE52
 static const char *WYZE_SERVICE_UUID  = "0000fe50-0000-1000-8000-00805f9b34fb";
 static const char *WYZE_WRITE_UUID    = "0000fe51-0000-1000-8000-00805f9b34fb";
 static const char *WYZE_NOTIFY_UUID   = "0000fe52-0000-1000-8000-00805f9b34fb";
@@ -53,13 +56,8 @@ static const char *NUS_TX_UUID        = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 static const uint16_t WYZE_COMPANY_ID = 0x4459;  // 'DY' little-endian
 
-// Known Wyze keypad advertisement names from firmware strings
 static const char * const WYZE_ADV_NAMES[] = {
-  "Wyze Lock",   // bound to lock
-  "DingDing",    // alt bound name
-  "KP-01",       // normal / unbound
-  "DD-Fact",     // factory mode
-  nullptr
+  "Wyze Lock", "DingDing", "KP-01", "DD-Fact", nullptr
 };
 
 #if DEBUG_SERIAL
@@ -135,21 +133,12 @@ NimBLEClient               *bleClient = nullptr;
 NimBLERemoteCharacteristic *writeChr  = nullptr;
 NimBLERemoteCharacteristic *notifyChr = nullptr;
 
-// ---- Packet presets (from firmware reverse-engineering) ------------------
-// Header: DE C0 AD DE
-// Byte[4] = command opcode
-//   0xFF = probe/identify
-//   0xFE = probe variant
-//   0x01 = bind request
-//   0x00 = unlock
-//   0x02 = keypress test
-// Byte[5] = sub-command / payload length
-// Bytes[6-7] = 0x1E F1 (checksum placeholder - may need real checksum)
-static const uint8_t PKT_FF[8]    = {0xDE,0xC0,0xAD,0xDE,0xFF,0x01,0x1E,0xF1}; // probe
-static const uint8_t PKT_FE[8]    = {0xDE,0xC0,0xAD,0xDE,0xFE,0x01,0x1E,0xF1}; // probe alt
-static const uint8_t PKT_BIND[8]  = {0xDE,0xC0,0xAD,0xDE,0x01,0x1E,0xF1,0x00}; // bind
-static const uint8_t PKT_UNLOCK[8]= {0xDE,0xC0,0xAD,0xDE,0x00,0x01,0x1E,0xF1}; // unlock
-static const uint8_t PKT_KP[8]    = {0xDE,0xC0,0xAD,0xDE,0x02,0x01,0x1E,0xF1}; // keypress
+// ---- Packet presets ------------------------------------------------------
+static const uint8_t PKT_FF[8]    = {0xDE,0xC0,0xAD,0xDE,0xFF,0x01,0x1E,0xF1};
+static const uint8_t PKT_FE[8]    = {0xDE,0xC0,0xAD,0xDE,0xFE,0x01,0x1E,0xF1};
+static const uint8_t PKT_BIND[8]  = {0xDE,0xC0,0xAD,0xDE,0x01,0x1E,0xF1,0x00};
+static const uint8_t PKT_UNLOCK[8]= {0xDE,0xC0,0xAD,0xDE,0x00,0x01,0x1E,0xF1};
+static const uint8_t PKT_KP[8]    = {0xDE,0xC0,0xAD,0xDE,0x02,0x01,0x1E,0xF1};
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -201,7 +190,6 @@ void loadSettings(){
   settings.bleAddress  =prefs.getString("ble_addr", "");
   settings.bleAddrType =prefs.getString("ble_atype","random");
   settings.bleName     =prefs.getString("ble_name", "Wyze Lock");
-  // Default to Wyze-specific UUIDs from firmware
   settings.serviceUuid =prefs.getString("svc_uuid", WYZE_SERVICE_UUID);
   settings.writeUuid   =prefs.getString("wr_uuid",  WYZE_WRITE_UUID);
   settings.notifyUuid  =prefs.getString("nt_uuid",  WYZE_NOTIFY_UUID);
@@ -255,28 +243,28 @@ void serviceMQTT(){}
 class ClientCB : public NimBLEClientCallbacks {
 public:
   void onConnect(NimBLEClient *c) override {
-    // NimBLE 2.x: getConnId() removed; conn params available via NimBLEConnInfo
-    addLog("BLE onConnect: "+String(c->getPeerAddress().toString().c_str()));
+    addLog(">>> CB onConnect peer="+String(c->getPeerAddress().toString().c_str())
+           +" isConn="+String(c->isConnected()));
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
   void onConnectFail(NimBLEClient *c, int reason) override {
-    addLog("BLE onConnectFail HCI=0x"+String(reason,HEX)
+    addLog(">>> CB onConnectFail HCI=0x"+String(reason,HEX)
            +" nimble=0x"+String(c->getLastError(),HEX)
-           +" ("+String(nimbleErrStr(c->getLastError()))+")");
+           +" ("+nimbleErrStr(c->getLastError())+")"
+           +" isConn="+String(c->isConnected()));
   }
   void onDisconnect(NimBLEClient *c, int reason) override {
-    (void)c;writeChr=nullptr;notifyChr=nullptr;
-    addLog("BLE onDisconnect reason=0x"+String(reason,HEX));
+    addLog(">>> CB onDisconnect reason=0x"+String(reason,HEX)
+           +" (HCI=0x"+String(reason&0xFF,HEX)+")"
+           +" peer="+String(c->getPeerAddress().toString().c_str()));
+    writeChr=nullptr; notifyChr=nullptr;
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
   void onAuthenticationComplete(NimBLEConnInfo &i) override {
-    addLog("BLE auth: enc="+String(i.isEncrypted())+" bonded="+String(i.isBonded())+" auth="+String(i.isAuthenticated()));
-    // NimBLE 2.x NimBLEConnInfo API:
-    //   getConnInterval()  - interval in 1.25ms units
-    //   getConnLatency()   - latency in number of intervals
-    //   getConnTimeout()   - supervision timeout in 10ms units  (NOT getSupervisionTimeout)
-    //   getMTU()           - MTU in bytes
-    addLog("  connInfo itvl="+String(i.getConnInterval())
+    addLog(">>> CB onAuthComplete enc="+String(i.isEncrypted())
+           +" bonded="+String(i.isBonded())
+           +" auth="+String(i.isAuthenticated()));
+    addLog("    connInfo itvl="+String(i.getConnInterval())
            +" latency="+String(i.getConnLatency())
            +" timeout="+String(i.getConnTimeout())
            +" mtu="+String(i.getMTU()));
@@ -304,15 +292,26 @@ void notifyCB(NimBLERemoteCharacteristic *c,uint8_t *d,size_t l,bool n){
   }
   mqttPublish(lastRxHex);
 }
+
 void deleteBleClient(){
-  if(bleClient){if(bleClient->isConnected())bleClient->disconnect();NimBLEDevice::deleteClient(bleClient);bleClient=nullptr;}
-  writeChr=nullptr;notifyChr=nullptr;
+  addLog("DBG deleteBleClient: ptr="+String((uint32_t)bleClient,HEX)
+         +" isConn="+String(bleClient?bleClient->isConnected():false));
+  if(bleClient){
+    if(bleClient->isConnected()){
+      addLog("DBG  -> calling disconnect()");
+      bleClient->disconnect();
+    }
+    addLog("DBG  -> calling NimBLEDevice::deleteClient()");
+    NimBLEDevice::deleteClient(bleClient);
+    bleClient=nullptr;
+  }
+  writeChr=nullptr; notifyChr=nullptr;
+  addLog("DBG deleteBleClient done");
 }
 bool isBleReady(){return bleClient&&bleClient->isConnected()&&writeChr;}
 
 // --------------------------------------------------------------------------
 // Full GATT dump
-// NimBLE 2.x: getCharacteristics() returns const ref, not pointer
 // --------------------------------------------------------------------------
 void dumpAllGatt() {
   if(!bleClient||!bleClient->isConnected()) {
@@ -355,8 +354,7 @@ void logWyzeMfrData(const NimBLEAdvertisedDevice *dev) {
   String hex;
   for(size_t i=0;i<len;i++){
     const char *h="0123456789ABCDEF";
-    hex += h[((uint8_t)m[i]>>4)&0xF];
-    hex += h[(uint8_t)m[i]&0xF];
+    hex += h[((uint8_t)m[i]>>4)&0xF]; hex += h[(uint8_t)m[i]&0xF];
     if(i+1<len) hex+=' ';
   }
   addLog("  Wyze mfr data ("+String(len)+" bytes): "+hex);
@@ -477,60 +475,115 @@ String scanJson(){
 // --------------------------------------------------------------------------
 // BLE connect
 // --------------------------------------------------------------------------
+// r7d: Returns true if connected (ok==true OR connect() returned false but
+//      isConnected() is true -- EALREADY can occur when connection succeeded
+//      at the HCI/controller level but the NimBLE host state machine had a
+//      conflict. Treating EALREADY as failure was causing deleteBleClient()
+//      to send a disconnect to the keypad (reason 0x216 = local host terminated)
+//      which made the keypad error-beep and exit pairing mode.
 bool tryConnect(const NimBLEAddress &addr,const char *label){
+  addLog(String("DBG tryConnect [") + label + "] creating client");
   bleClient=NimBLEDevice::createClient();
   bleClient->setClientCallbacks(&gClientCB,false);
   bleClient->setConnectionParams(24,40,0,400);
-  // r7c: NimBLE 2.x setConnectTimeout() unit is 10ms, NOT seconds.
-  //      500 * 10ms = 5 seconds. Old value of 10 = 100ms caused instant ETIMEOUT.
+  // NimBLE 2.x: setConnectTimeout unit = 10ms. 500 = 5 seconds.
   bleClient->setConnectTimeout(500);
-  addLog(String(label)+": connecting to "+String(addr.toString().c_str())+" type="+String(addr.getType()));
+  addLog(String(label)+": connecting to "+String(addr.toString().c_str())
+         +" type="+String(addr.getType()));
+
+  unsigned long t0=millis();
   bool ok=bleClient->connect(addr,false);
   int le=bleClient->getLastError();
-  addLog(String(label)+": connect="+String(ok?"OK":"FAIL")+" lastErr=0x"+String(le,HEX)+" ("+nimbleErrStr(le)+")");
-  return ok;
+  bool actuallyConnected=bleClient->isConnected();
+  unsigned long elapsed=millis()-t0;
+
+  addLog(String(label)+": connect() returned "+String(ok?"true":"false")
+         +" lastErr=0x"+String(le,HEX)+" ("+nimbleErrStr(le)+")"
+         +" isConnected="+String(actuallyConnected)
+         +" elapsed="+String(elapsed)+"ms");
+
+  // If connect() returned false but we ARE actually connected, treat as success.
+  // This handles EALREADY race where HCI connected but NimBLE host flagged conflict.
+  if(!ok && actuallyConnected) {
+    addLog(String(label)+": connect() false but isConnected=true -> treating as SUCCESS");
+    return true;
+  }
+  // If connect() returned true but somehow not connected, log it
+  if(ok && !actuallyConnected) {
+    addLog(String(label)+": WARNING connect() true but isConnected=false");
+  }
+  return ok || actuallyConnected;
 }
 
 bool connectBle(){
+  addLog("DBG connectBle: start");
   deleteBleClient();
   String target=settings.bleAddress;target.trim();target.toUpperCase();
-  if(settings.serviceUuid.isEmpty()||settings.writeUuid.isEmpty()){addLog("Connect skipped: UUIDs not set");return false;}
-  if(target.isEmpty()&&settings.bleName.isEmpty()){addLog("Connect skipped: no target");return false;}
+  if(settings.serviceUuid.isEmpty()||settings.writeUuid.isEmpty()){
+    addLog("Connect skipped: UUIDs not set");return false;
+  }
+  if(target.isEmpty()&&settings.bleName.isEmpty()){
+    addLog("Connect skipped: no target");return false;
+  }
 
+  addLog("DBG connectBle: starting scan (target="+target+")");
   bool found=doScanFindTarget(settings.scanSeconds,target);
-  if(!found||!gFoundValid){addLog("Target not found");esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;}
+  if(!found||!gFoundValid){
+    addLog("Target not found");esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;
+  }
 
-  addLog("Pre-connect: saved bytes="+bytesToHex(gFoundAddrBytes,6)+" type="+String(gFoundAddrType)+" ("+String(gFoundAddrType==BLE_ADDR_RANDOM?"random":"public")+")");
+  addLog("Pre-connect: saved bytes="+bytesToHex(gFoundAddrBytes,6)
+         +" type="+String(gFoundAddrType)
+         +" ("+String(gFoundAddrType==BLE_ADDR_RANDOM?"random":"public")+")");
   String typeStr=(gFoundAddrType==BLE_ADDR_RANDOM)?"random":"public";
-  if(settings.bleAddrType!=typeStr){settings.bleAddrType=typeStr;saveSettings();addLog("addrType corrected to "+typeStr);}
+  if(settings.bleAddrType!=typeStr){
+    settings.bleAddrType=typeStr;saveSettings();
+    addLog("addrType corrected to "+typeStr);
+  }
 
-  // r7c: Allow controller to fully settle after scan before switching coex and connecting.
-  //      Old 100ms was insufficient; 500ms post-scan + 100ms post-coex-switch.
+  addLog("DBG connectBle: post-scan settle 500ms");
   delay(500);
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
+  addLog("DBG connectBle: coex->BT, settle 100ms");
   delay(100);
 
   ble_addr_t bleAddr;bleAddr.type=gFoundAddrType;memcpy(bleAddr.val,gFoundAddrBytes,6);
   NimBLEAddress peerAddr(bleAddr);
   addLog("Attempt 1: "+String(peerAddr.toString().c_str())+" type="+String(peerAddr.getType()));
   bool ok=tryConnect(peerAddr,"Attempt1");
-  if(!ok){
-    // r7c: Increased delay 200->400ms to let stale onDisconnect event drain
-    //      before creating a new client, avoiding BLE_HS_EALREADY race.
-    deleteBleClient();delay(400);
-    char addrStr[18];
-    snprintf(addrStr,sizeof(addrStr),"%02x:%02x:%02x:%02x:%02x:%02x",
-             gFoundAddrBytes[5],gFoundAddrBytes[4],gFoundAddrBytes[3],
-             gFoundAddrBytes[2],gFoundAddrBytes[1],gFoundAddrBytes[0]);
-    NimBLEAddress fallback(addrStr,gFoundAddrType);
-    addLog("Attempt 2: "+String(fallback.toString().c_str())+" type="+String(fallback.getType()));
-    ok=tryConnect(fallback,"Attempt2");
-  }
-  if(!ok){deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;}
 
-  addLog("Link up!");
+  if(!ok){
+    addLog("DBG connectBle: Attempt1 failed, isConn="+String(bleClient?bleClient->isConnected():false));
+    // Only delete/retry if we're truly not connected
+    if(bleClient && bleClient->isConnected()) {
+      addLog("DBG connectBle: client IS connected despite fail return -- proceeding");
+      ok = true;
+    } else {
+      addLog("DBG connectBle: deleting client, waiting 400ms before Attempt2");
+      deleteBleClient(); delay(400);
+      char addrStr[18];
+      snprintf(addrStr,sizeof(addrStr),"%02x:%02x:%02x:%02x:%02x:%02x",
+               gFoundAddrBytes[5],gFoundAddrBytes[4],gFoundAddrBytes[3],
+               gFoundAddrBytes[2],gFoundAddrBytes[1],gFoundAddrBytes[0]);
+      NimBLEAddress fallback(addrStr,gFoundAddrType);
+      addLog("Attempt 2: "+String(fallback.toString().c_str())+" type="+String(fallback.getType()));
+      ok=tryConnect(fallback,"Attempt2");
+      if(!ok) {
+        addLog("DBG connectBle: Attempt2 failed, isConn="+String(bleClient?bleClient->isConnected():false));
+      }
+    }
+  }
+
+  if(!ok){
+    addLog("DBG connectBle: all attempts failed, cleaning up");
+    deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;
+  }
+
+  addLog("Link up! isConn="+String(bleClient->isConnected()));
+  addLog("DBG connectBle: exchanging MTU");
   bleClient->exchangeMTU();
   addLog("MTU="+String(bleClient->getMTU()));
+  addLog("DBG connectBle: updating conn params");
   bleClient->updateConnParams(12,12,0,200);
   dumpAllGatt();
 
@@ -542,13 +595,19 @@ bool connectBle(){
       addLog("Trying short UUID 0xFE50...");
       svc=bleClient->getService(NimBLEUUID((uint16_t)0xFE50));
     }
-    if(!svc){addLog("Service still not found.");deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;}
+    if(!svc){
+      addLog("Service still not found.");
+      deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;
+    }
   }
   addLog("Service found: "+String(svc->getUUID().toString().c_str()));
 
   writeChr=svc->getCharacteristic(NimBLEUUID(settings.writeUuid.c_str()));
   if(!writeChr) writeChr=svc->getCharacteristic(NimBLEUUID((uint16_t)0xFE51));
-  if(!writeChr){addLog("Write chr not found");deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;}
+  if(!writeChr){
+    addLog("Write chr not found");
+    deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;
+  }
   addLog("Write chr: "+String(writeChr->getUUID().toString().c_str())
          +" canWrite="+String((writeChr->canWrite()||writeChr->canWriteNoResponse())?"yes":"no"));
 
@@ -556,9 +615,11 @@ bool connectBle(){
     notifyChr=svc->getCharacteristic(NimBLEUUID(settings.notifyUuid.c_str()));
     if(!notifyChr) notifyChr=svc->getCharacteristic(NimBLEUUID((uint16_t)0xFE52));
     if(notifyChr&&(notifyChr->canNotify()||notifyChr->canIndicate())){
-      if(notifyChr->subscribe(true,notifyCB))addLog("Notify subscribed: "+String(notifyChr->getUUID().toString().c_str()));
+      addLog("DBG connectBle: subscribing notify");
+      if(notifyChr->subscribe(true,notifyCB))
+        addLog("Notify subscribed: "+String(notifyChr->getUUID().toString().c_str()));
       else addLog("Notify subscribe failed");
-    }else addLog("Notify chr not subscribable");
+    } else addLog("Notify chr not subscribable");
   }
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   addLog("BLE ready");
@@ -677,7 +738,7 @@ void serviceBleAutoConnect(){
 }
 
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r7c");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r7d");
   loadSettings();
   addLog("addr="+settings.bleAddress+" storedType="+settings.bleAddrType);
   addLog("svc="+settings.serviceUuid);
