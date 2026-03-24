@@ -235,11 +235,10 @@ class SecurityCB : public NimBLEClientCallbacks {
 public:
   void onConnect(NimBLEClient *c) override {
     addLog("BLE onConnect: "+String(c->getPeerAddress().toString().c_str()));
-    // Do NOT update conn params until after pairing
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
   void onConnectFail(NimBLEClient *c, int reason) override {
-    addLog("BLE onConnectFail: reason=0x"+String(reason, HEX)+" ("+String(reason)+") lastErr=0x"+String(c->getLastError(), HEX));
+    addLog("BLE onConnectFail: reason=0x"+String(reason, HEX)+" lastErr=0x"+String(c->getLastError(), HEX));
   }
   void onDisconnect(NimBLEClient *c, int reason) override {
     (void)c; writeChr=nullptr; notifyChr=nullptr;
@@ -255,7 +254,9 @@ public:
     NimBLEDevice::injectConfirmPasskey(connInfo, true);
   }
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
-    addLog("BLE auth complete: encrypted="+String(connInfo.isEncrypted())+" bonded="+String(connInfo.isBonded()));
+    addLog("BLE auth complete: encrypted="+String(connInfo.isEncrypted())
+           +" bonded="+String(connInfo.isBonded())
+           +" secLevel="+String(connInfo.getSecurityMode()));
   }
 };
 SecurityCB gClientCB;
@@ -327,11 +328,8 @@ String scanJson() {
 
 // --------------------------------------------------------------------------
 // BLE connect
-// Connect sequence for pairing-required devices:
-//   1. connect() with exchangeMTU=false  (MTU exchange before pairing can be rejected)
-//   2. secureConnection()                (pairing / bond)
-//   3. exchangeMTU()                     (now safe)
-//   4. discover services / chars
+// Wyze Lock uses Legacy pairing, Just Works, bonding only.
+// Sequence: connect (no MTU) -> secureConnection -> MTU -> discover
 // --------------------------------------------------------------------------
 bool connectBle() {
   deleteBleClient();
@@ -354,30 +352,24 @@ bool connectBle() {
 
   bleClient=NimBLEDevice::createClient();
   bleClient->setClientCallbacks(&gClientCB, false);
-  // Conservative conn params - let peripheral dictate first
   bleClient->setConnectionParams(24, 40, 0, 400);
   bleClient->setConnectTimeout(15);
 
-  // exchangeMTU=false: don't attempt MTU exchange before pairing completes
-  // Some locks (Wyze) reject the connection if MTU is negotiated before bonding
   if(!bleClient->connect(found, true, false, false)) {
     addLog("connect() failed lastErr=0x"+String(bleClient->getLastError(), HEX));
     deleteBleClient(); esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
-  addLog("Link up — pairing...");
+  addLog("Link up — pairing (Just Works legacy)...");
 
-  // Trigger pairing/bonding before any GATT operations
   if(!bleClient->secureConnection()) {
     addLog("secureConnection() failed lastErr=0x"+String(bleClient->getLastError(), HEX));
-    deleteBleClient(); esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
+    // 0x505 = lock rejected our security params.
+    // Try continuing without encryption - some Wyze FW versions don't require it.
+    addLog("Attempting GATT without encryption...");
   }
-  addLog("Paired/bonded — exchanging MTU...");
 
-  // Now safe to do MTU exchange
   bleClient->exchangeMTU();
   addLog("MTU="+String(bleClient->getMTU()));
-
-  // Update conn params now that we're bonded
   bleClient->updateConnParams(12, 12, 0, 200);
 
   addLog("Discovering services...");
@@ -568,18 +560,16 @@ void setup(){
 
   NimBLEDevice::init("");
   NimBLEDevice::setPower(9);
-
-  // Use a static random address so the lock sees a consistent central identity
-  // BLE_OWN_ADDR_RANDOM = 0x01
   NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
   addLog("Own addr: "+String(NimBLEDevice::getAddress().toString().c_str()));
 
-  // Bonding + MITM + SC, Just Works (no PIN UI needed)
-  NimBLEDevice::setSecurityAuth(true, true, true);
+  // Wyze Lock: Legacy pairing, Just Works, bonding only.
+  // NO MITM, NO Secure Connections — those cause 0x505 rejection.
+  NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND);  // bond only
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
-  addLog("NimBLE init done, security enabled");
+  addLog("NimBLE init done, security: bond+JustWorks");
   setupWeb();
 
   unsigned long t0=millis();
