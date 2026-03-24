@@ -56,6 +56,8 @@
 //       - All RX bytes dumped raw + decoded. TX bytes dumped raw.
 //       - "time since connect" in state JSON for diagnosing timeouts.
 //       - Connection event timestamps logged to ms precision.
+//  r10a: Fix compile: remove setAdvertisementType() -- not present in NimBLE 2.x.
+//        Default advertising mode is already undirected connectable (BLE_GAP_CONN_MODE_UND).
 
 #define DEBUG_SERIAL 1
 
@@ -332,7 +334,6 @@ bool sendNotify(const uint8_t *d, size_t l, const char *tag) {
 // Decode a received dd_protocol packet
 // --------------------------------------------------------------------------
 void decodeRxPacket(const uint8_t *d, size_t l) {
-  // Log all bytes raw first
   addLog("  RAW["+String(l)+"]: "+bytesToHex(d,l));
 
   if(l >= 5 && d[0]==0xDE && d[1]==0xC0 && d[2]==0xAD && d[3]==0xDE) {
@@ -348,22 +349,16 @@ void decodeRxPacket(const uint8_t *d, size_t l) {
     }
     String payload = (l>5) ? bytesToHex(d+5, l-5) : "(none)";
     addLog("  -> dd_proto magic OK op="+opName+" payload["+String(l-5)+"]="+payload);
-
-    // If keypad sends GET_RANDOM opcode (0xFF) as a framed packet
-    if(op == 0xFF && l >= 13) {
-      // Some versions embed the nonce in the payload bytes
+    if(op == 0xFF && l >= 13)
       addLog("  -> GET_RANDOM: nonce may be in payload: "+bytesToHex(d+5, l-5));
-    }
     mqttPublish(bytesToHex(d,l));
     return;
   }
 
-  // r9/r10: Unframed 8-byte nonce (GET_RANDOM challenge, no magic header)
   if(l == 8) {
-    addLog("  -> 8-byte unframed packet -- treating as GET_RANDOM nonce challenge");
+    addLog("  -> 8-byte unframed -- treating as GET_RANDOM nonce challenge");
     memcpy(gLastNonce, d, 8);
     gNonceReceived = true;
-
     uint8_t resp[8] = {0};
     if(computeAuthResponse(gLastNonce, resp)) {
       addLog("  -> AES-ECB auth response: "+bytesToHex(resp,8));
@@ -377,7 +372,6 @@ void decodeRxPacket(const uint8_t *d, size_t l) {
     return;
   }
 
-  // Unknown
   addLog("  -> Unknown packet (len="+String(l)+") -- no magic header, not 8 bytes");
   mqttPublish(bytesToHex(d,l));
 }
@@ -388,8 +382,8 @@ void decodeRxPacket(const uint8_t *d, size_t l) {
 class ServerCB : public NimBLEServerCallbacks {
 public:
   void onConnect(NimBLEServer *srv, NimBLEConnInfo &info) override {
-    gAdvConnected = true;
-    gConnHandle   = info.getConnHandle();
+    gAdvConnected  = true;
+    gConnHandle    = info.getConnHandle();
     gConnectedAtMs = millis();
     gAdvPeer = String(info.getAddress().toString().c_str());
     addLog(">>> PERIPH onConnect peer="+gAdvPeer
@@ -399,12 +393,11 @@ public:
            +" latency="+String(info.getConnLatency())
            +" timeout="+String(info.getConnTimeout())
            +" mtu="+String(info.getMTU()));
-    // Stop advertising while connected (save radio time for WiFi coex)
     NimBLEDevice::getAdvertising()->stop();
     addLog("    Advertising stopped (connected)");
   }
   void onDisconnect(NimBLEServer *srv, NimBLEConnInfo &info, int reason) override {
-    unsigned long connDurationMs = gConnectedAtMs ? (millis() - gConnectedAtMs) : 0;
+    unsigned long connDurationMs = gConnectedAtMs ? (millis()-gConnectedAtMs) : 0;
     addLog(">>> PERIPH onDisconnect peer="+String(info.getAddress().toString().c_str())
            +" reason=0x"+String(reason,HEX)
            +" (HCI=0x"+String(reason&0xFF,HEX)+")"
@@ -415,7 +408,6 @@ public:
     gConnectedAtMs = 0;
     gAdvPeer       = "";
     gNonceReceived = false;
-    // Auto-restart advertising after disconnect
     addLog("    Restarting advertising...");
     NimBLEDevice::getAdvertising()->start();
     addLog("    Advertising restarted");
@@ -449,13 +441,12 @@ public:
     decodeRxPacket(d, l);
   }
   void onSubscribe(NimBLECharacteristic *chr, NimBLEConnInfo &info, uint16_t subValue) override {
-    addLog(">>> TX chr subscribe subValue="+String(subValue,HEX)
+    addLog(">>> TX chr subscribe subValue=0x"+String(subValue,HEX)
            +" peer="+String(info.getAddress().toString().c_str()));
-    // subValue: 0=unsub, 1=notify, 2=indicate
     if(subValue == 1) {
       unsigned long tSinceConn = gConnectedAtMs ? (millis()-gConnectedAtMs) : 0;
-      addLog("    Keypad subscribed to notifications! tSinceConn="+String(tSinceConn)+"ms");
-      addLog("    r10: Peripheral mode -- waiting for keypad to write GET_RANDOM nonce to us");
+      addLog("    Keypad subscribed to notifications tSinceConn="+String(tSinceConn)+"ms");
+      addLog("    Waiting for keypad to write GET_RANDOM nonce to NUS_RX...");
     }
   }
 };
@@ -464,37 +455,29 @@ RxCharCB gRxCharCB;
 // --------------------------------------------------------------------------
 // Setup BLE peripheral (NUS server)
 // --------------------------------------------------------------------------
-// Advertise as "Wyze Lock" with:
-//   - NUS service UUID in adv
-//   - Manufacturer data matching known lock pattern:
-//     Company ID 0x4459 (Wyze), then lock MAC bytes + device type 0x0A
-// The keypad should recognize this and connect.
 void setupBlePeripheral() {
   addLog("r10: Setting up BLE peripheral (NUS server)...");
-
   NimBLEDevice::setSecurityAuth(0);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   bleServer = NimBLEDevice::createServer();
   bleServer->setCallbacks(&gServerCB);
 
-  // Create NUS service
   nusService = bleServer->createService(NUS_SERVICE_UUID);
 
-  // RX characteristic: keypad writes here (commands/nonce)
+  // RX: keypad writes commands/nonce here
   rxChr = nusService->createCharacteristic(
     NUS_RX_UUID,
     NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
   );
   rxChr->setCallbacks(&gRxCharCB);
 
-  // TX characteristic: we notify keypad (auth response, lock status)
+  // TX: we notify keypad (auth resp, lock status)
   txChr = nusService->createCharacteristic(
     NUS_TX_UUID,
     NIMBLE_PROPERTY::NOTIFY
   );
-  // TX chr also needs onSubscribe -- reuse RxCharCB for subscribe event
-  txChr->setCallbacks(&gRxCharCB);
+  txChr->setCallbacks(&gRxCharCB);  // reuse for onSubscribe
 
   nusService->start();
   addLog("r10: NUS service started");
@@ -508,40 +491,29 @@ void startAdvertising() {
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   adv->reset();
 
-  // Advertise the NUS service UUID so keypad can find us
   adv->addServiceUUID(NUS_SERVICE_UUID);
-  // Also include battery service (0x180f) since real lock advertises it
-  adv->addServiceUUID("180f");
-
-  // Set advertised name to "Wyze Lock" -- this is what the keypad scans for
+  adv->addServiceUUID("180f");  // Battery -- real lock advertises this too
   adv->setName("Wyze Lock");
 
-  // Manufacturer data: Company ID 0x4459 (Wyze/DY) + lock-like payload
-  // Real lock mfr data (11 bytes): 59 44 E2 79 A5 DC 36 4D 00 02 0A
-  //   [0-1] = 0x5944 (company ID little-endian = 0x4459)
-  //   [2-7] = MAC address bytes of lock (E2:79:A5:DC:36:4D)
-  //   [8]   = 0x00
-  //   [9]   = 0x02
-  //   [10]  = 0x0A (device type = Wyze Lock)
-  // We use our own BLE MAC in place of the lock MAC.
+  // Manufacturer data mirroring real lock: 59 44 <MAC 6 bytes> 00 02 0A
   NimBLEAddress ownAddr = NimBLEDevice::getAddress();
   const uint8_t *mac = ownAddr.getBase()->val;
   uint8_t mfrData[11] = {
-    0x59, 0x44,          // Company ID 0x4459 little-endian
-    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],  // our MAC
-    0x00, 0x02, 0x0A     // status / device type = lock
+    0x59, 0x44,
+    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+    0x00, 0x02, 0x0A
   };
   adv->setManufacturerData(std::string((char*)mfrData, sizeof(mfrData)));
 
-  adv->setAdvertisementType(BLE_GAP_CONN_MODE_UND);  // undirected connectable
-  adv->setMinInterval(32);   // 20ms
-  adv->setMaxInterval(64);   // 40ms
+  // NimBLE 2.x: no setAdvertisementType() -- undirected connectable is the default
+  adv->setMinInterval(32);  // 20ms
+  adv->setMaxInterval(64);  // 40ms
 
   bool ok = adv->start();
-  addLog("r10: Advertising started as 'Wyze Lock' NUS peripheral: "+String(ok?"OK":"FAIL"));
+  addLog("r10: Advertising as 'Wyze Lock' NUS peripheral: "+String(ok?"OK":"FAIL"));
   addLog("  Own addr: "+String(NimBLEDevice::getAddress().toString().c_str()));
   addLog("  Mfr data: "+bytesToHex(mfrData, sizeof(mfrData)));
-  addLog("  NOTE: Keypad must be in pairing mode (hold * until LED blinks)");
+  addLog("  NOTE: Put keypad in pairing mode (hold * until LED blinks rapidly)");
 }
 
 void stopAdvertising() {
@@ -550,7 +522,7 @@ void stopAdvertising() {
 }
 
 // --------------------------------------------------------------------------
-// Legacy: BLE scan (for diagnostics only in r10)
+// Diagnostic BLE scan (peripheral pauses adv, scans, resumes adv)
 // --------------------------------------------------------------------------
 bool isWyzeDevice(const NimBLEAdvertisedDevice *dev){
   if(dev->haveManufacturerData()) {
@@ -571,20 +543,16 @@ void logWyzeMfrData(const NimBLEAdvertisedDevice *dev) {
   size_t len = m.size();
   String hex; for(size_t i=0;i<len;i++){const char *h="0123456789ABCDEF";hex+=h[((uint8_t)m[i]>>4)&0xF];hex+=h[(uint8_t)m[i]&0xF];if(i+1<len)hex+=' ';}
   addLog("  Wyze mfr data ("+String(len)+" bytes): "+hex);
-  if(len>3)addLog("  -> protocol=0x"+String((uint8_t)m[2],HEX)+" payloadLen="+String((uint8_t)m[3]));
-  if(len>=10){char macStr[18];snprintf(macStr,sizeof(macStr),"%02X:%02X:%02X:%02X:%02X:%02X",(uint8_t)m[9],(uint8_t)m[8],(uint8_t)m[7],(uint8_t)m[6],(uint8_t)m[5],(uint8_t)m[4]);addLog("  -> embedded MAC: "+String(macStr));}
+  if(len>=10){char ms[18];snprintf(ms,sizeof(ms),"%02X:%02X:%02X:%02X:%02X:%02X",(uint8_t)m[9],(uint8_t)m[8],(uint8_t)m[7],(uint8_t)m[6],(uint8_t)m[5],(uint8_t)m[4]);addLog("  -> embedded MAC: "+String(ms));}
   if(len>10){uint8_t dt=(uint8_t)m[10];addLog("  -> devType="+(dt==0x07?String("KP-01"):(dt==0x0A?String("Wyze Lock"):("0x"+String(dt,HEX)))));}
-  if(len>11){uint8_t ps=(uint8_t)m[11];addLog("  -> pairStatus=0x"+String(ps,HEX)+" ("+(ps==0x0A?"PAIRED":ps==0x00?"UNPAIRED":"UNKNOWN")+")");}
 }
 
 String scanJson(){
   if(gAdvConnected){addLog("Scan skipped: peripheral is connected");return lastScanJson;}
   if(scanRunning){addLog("Scan busy");return lastScanJson;}
-  scanRunning=true;gFoundValid=false;
-  // Pause advertising during scan
+  scanRunning=true;
   NimBLEDevice::getAdvertising()->stop();
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
-  addLog("Coex -> BLE priority (diag scan)");
   NimBLEScan *scan=NimBLEDevice::getScan();
   scan->setActiveScan(true);scan->setInterval(40);scan->setWindow(40);scan->setDuplicateFilter(false);
   addLog("BLE diag scan "+String(settings.scanSeconds)+"s");
@@ -599,32 +567,28 @@ String scanJson(){
     int rssi=dev->getRSSI();uint8_t at=addr.getType();
     String ats=(at==BLE_ADDR_RANDOM)?"random":"public";
     bool wyze=isWyzeDevice(dev);
-    addLog("  "+addrStr+" type="+String(at)+" ["+ats+"] '"+name+"' rssi="+String(rssi)+(wyze?" [Wyze]":""));
+    addLog("  "+addrStr+" ["+ats+"] '"+name+"' rssi="+String(rssi)+(wyze?" [Wyze]":""));
     if(wyze)logWyzeMfrData(dev);
     if(!first)json+=",";first=false;
     json+="{\"addr\":\""+jsonEscape(addrStr)+"\",\"addrType\":\""+ats+"\",\"name\":\""+jsonEscape(name)+"\",\"rssi\":"+String(rssi)+",\"wyze\":"+String(wyze?"true":"false")+"}";
   }
   json+="]";lastScanJson=json;
   scan->stop();scan->clearResults();
-  addLog("Scan stopped");
   scanRunning=false;
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
-  addLog("Coex -> balanced");
-  // Restart advertising
   if(!gAdvConnected) NimBLEDevice::getAdvertising()->start();
+  addLog("Advertising resumed");
   return lastScanJson;
 }
 
 // --------------------------------------------------------------------------
-// Legacy client stubs (not used in normal r10 flow but kept for manual debug)
+// Helpers / packet presets
 // --------------------------------------------------------------------------
 bool isBleReady(){return gAdvConnected && txChr;}
+bool sendNotifyFwd(const uint8_t *d,size_t l,const char *tag){ return sendNotify(d,l,tag); }
 bool sendPacket(const uint8_t *d,size_t l,const char *tag){ return sendNotify(d,l,tag); }
 bool sendRawHex(const String &hex){std::vector<uint8_t>buf;if(!parseHexString(hex,buf)){addLog("Hex parse failed: '"+hex+"'");return false;}return sendPacket(buf.data(),buf.size(),"RAW");}
 
-// --------------------------------------------------------------------------
-// Packet presets (sent via notify to keypad)
-// --------------------------------------------------------------------------
 static const uint8_t PKT_FF[8]    = {0xDE,0xC0,0xAD,0xDE,0xFF,0x01,0x1E,0xF1};
 static const uint8_t PKT_FE[8]    = {0xDE,0xC0,0xAD,0xDE,0xFE,0x01,0x1E,0xF1};
 static const uint8_t PKT_BIND[8]  = {0xDE,0xC0,0xAD,0xDE,0x01,0x1E,0xF1,0x00};
@@ -645,7 +609,7 @@ String makeStateJson(){
   String json;json.reserve(4096);
   String ip=WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"";
   String apIp=portalMode?WiFi.softAPIP().toString():"";
-  unsigned long tSinceConn = (gAdvConnected && gConnectedAtMs) ? (millis()-gConnectedAtMs) : 0;
+  unsigned long tSinceConn=(gAdvConnected&&gConnectedAtMs)?(millis()-gConnectedAtMs):0;
   json+="{";
   json+="\"hostname\":\""+String(HOSTNAME)+"\",";
   json+="\"wifiConnected\":"+String(WiFi.status()==WL_CONNECTED?"true":"false")+",";
@@ -654,27 +618,17 @@ String makeStateJson(){
   json+="\"ssid\":\""+jsonEscape(settings.wifiSsid)+"\",";
   json+="\"mac\":\""+jsonEscape(WiFi.macAddress())+"\",";
   json+="\"rssi\":"+String(WiFi.status()==WL_CONNECTED?WiFi.RSSI():0)+",";
-  // Peripheral state
   json+="\"bleMode\":\"peripheral\",";
   json+="\"advConnected\":"+String(gAdvConnected?"true":"false")+",";
   json+="\"advPeer\":\""+jsonEscape(gAdvPeer)+"\",";
   json+="\"tSinceConnMs\":"+String(tSinceConn)+",";
   json+="\"ownBleAddr\":\""+String(NimBLEDevice::getAddress().toString().c_str())+"\",";
   json+="\"bleConnected\":"+String(isBleReady()?"true":"false")+",";
-  json+="\"bleAddress\":\""+jsonEscape(settings.bleAddress)+"\",";
-  json+="\"bleAddrType\":\""+jsonEscape(settings.bleAddrType)+"\",";
-  json+="\"bleName\":\""+jsonEscape(settings.bleName)+"\",";
-  json+="\"serviceUuid\":\""+jsonEscape(settings.serviceUuid)+"\",";
-  json+="\"writeUuid\":\""+jsonEscape(settings.writeUuid)+"\",";
-  json+="\"writeWithResponse\":"+String(settings.writeWithResponse?"true":"false")+",";
-  json+="\"notifyUuid\":\""+jsonEscape(settings.notifyUuid)+"\",";
-  json+="\"autoConnect\":"+String(settings.autoConnect?"true":"false")+",";
-  json+="\"scanSeconds\":"+String(settings.scanSeconds)+",";
-  json+="\"mqttHost\":\""+jsonEscape(settings.mqttHost)+"\",\"mqttPort\":"+String(settings.mqttPort)+",";
-  json+="\"mqttUser\":\""+jsonEscape(settings.mqttUser)+"\",\"mqttTopic\":\""+jsonEscape(settings.mqttTopic)+"\",";
   json+="\"nonceReceived\":"+String(gNonceReceived?"true":"false")+",";
   json+="\"lastNonce\":\""+String(gNonceReceived?bytesToHex(gLastNonce,8):"")+"\",";
   json+="\"lastTx\":\""+jsonEscape(lastTxHex)+"\",\"lastRx\":\""+jsonEscape(lastRxHex)+"\",";
+  json+="\"autoConnect\":"+String(settings.autoConnect?"true":"false")+",";
+  json+="\"scanSeconds\":"+String(settings.scanSeconds)+",";
   json+="\"logs\":\""+jsonEscape(logBuffer)+"\",\"scan\":"+lastScanJson;
   json+="}";return json;
 }
@@ -686,14 +640,6 @@ void handleRoot()  {server.send_P(200,"text/html",INDEX_HTML);}
 void handleState() {server.send(200,"application/json",makeStateJson());}
 void handleScan()  {server.send(200,"application/json",scanJson());}
 void handleSaveConfig(){
-  settings.bleAddress  =server.arg("bleAddress");  settings.bleAddress.trim();
-  settings.bleAddrType =server.arg("bleAddrType"); if(settings.bleAddrType!="random")settings.bleAddrType="public";
-  settings.bleName     =server.arg("bleName");
-  settings.serviceUuid =server.arg("serviceUuid"); settings.serviceUuid.trim();
-  settings.writeUuid   =server.arg("writeUuid");   settings.writeUuid.trim();
-  settings.notifyUuid  =server.arg("notifyUuid");  settings.notifyUuid.trim();
-  settings.autoConnect      =argBool("autoConnect",      settings.autoConnect);
-  settings.writeWithResponse=argBool("writeWithResponse",settings.writeWithResponse);
   if(server.hasArg("scanSeconds")){int v=server.arg("scanSeconds").toInt();if(v<1)v=1;if(v>20)v=20;settings.scanSeconds=(uint8_t)v;}
   if(server.hasArg("mqttHost")) settings.mqttHost =server.arg("mqttHost");
   if(server.hasArg("mqttPort")) settings.mqttPort =(uint16_t)server.arg("mqttPort").toInt();
@@ -706,30 +652,34 @@ void handleSaveWifi(){settings.wifiSsid=server.arg("ssid");settings.wifiPsk=serv
 void handleClearBonds(){NimBLEDevice::deleteAllBonds();addLog("Bonds cleared");sendOk("Bonds cleared");}
 void handleStartAdv()  {startAdvertising();sendOk("Advertising started");}
 void handleStopAdv()   {stopAdvertising();sendOk("Advertising stopped");}
-void handleSendFF()    {sendPacket(PKT_FF,   sizeof(PKT_FF),   "PROBE_FF")?sendOk("Probe FF sent"):sendErr("FF failed");}
-void handleSendFE()    {sendPacket(PKT_FE,   sizeof(PKT_FE),   "PROBE_FE")?sendOk("Probe FE sent"):sendErr("FE failed");}
-void handleSendBind()  {sendPacket(PKT_BIND, sizeof(PKT_BIND), "BIND")?sendOk("Bind sent"):sendErr("Bind failed");}
-void handleSendUnlock(){sendPacket(PKT_UNLOCK,sizeof(PKT_UNLOCK),"UNLOCK")?sendOk("Unlock sent"):sendErr("Unlock failed");}
-void handleSendKP()    {sendPacket(PKT_KP,   sizeof(PKT_KP),   "KEYPRESS")?sendOk("Keypress sent"):sendErr("Keypress failed");}
-void handleSendRaw()   {sendRawHex(server.arg("hex"))?sendOk("Raw sent"):sendErr("Raw failed");}
+void handleSendFF()    {sendPacket(PKT_FF,   sizeof(PKT_FF),   "PROBE_FF")?sendOk("Sent"):sendErr("Failed");}
+void handleSendFE()    {sendPacket(PKT_FE,   sizeof(PKT_FE),   "PROBE_FE")?sendOk("Sent"):sendErr("Failed");}
+void handleSendBind()  {sendPacket(PKT_BIND, sizeof(PKT_BIND), "BIND")?sendOk("Sent"):sendErr("Failed");}
+void handleSendUnlock(){sendPacket(PKT_UNLOCK,sizeof(PKT_UNLOCK),"UNLOCK")?sendOk("Sent"):sendErr("Failed");}
+void handleSendKP()    {sendPacket(PKT_KP,   sizeof(PKT_KP),   "KEYPRESS")?sendOk("Sent"):sendErr("Failed");}
+void handleSendRaw()   {sendRawHex(server.arg("hex"))?sendOk("Sent"):sendErr("Failed");}
 void handleClearLog()  {logBuffer="";lastTxHex="";lastRxHex="";sendOk("Log cleared");}
 void handleReboot()    {sendOk("Rebooting");delay(200);ESP.restart();}
-void handleSendAuthResp(){sendAuthResp()?sendOk("Auth resp sent"):sendErr("Auth resp failed - check log");}
-void handleSendNotify(){
-  String hex=server.arg("hex");
-  sendRawHex(hex)?sendOk("Notify sent"):sendErr("Notify failed");
-}
+void handleSendAuthResp(){sendAuthResp()?sendOk("Auth resp sent"):sendErr("Auth resp failed");}
+void handleSendNotify() {sendRawHex(server.arg("hex"))?sendOk("Notify sent"):sendErr("Notify failed");}
 
 void setupWeb(){
-  server.on("/",HTTP_GET,handleRoot);server.on("/api/state",HTTP_GET,handleState);
+  server.on("/",HTTP_GET,handleRoot);
+  server.on("/api/state",HTTP_GET,handleState);
   server.on("/api/scan",HTTP_GET,handleScan);
-  server.on("/api/saveConfig",HTTP_POST,handleSaveConfig);server.on("/api/saveWifi",HTTP_POST,handleSaveWifi);
-  server.on("/api/startAdv",HTTP_POST,handleStartAdv);server.on("/api/stopAdv",HTTP_POST,handleStopAdv);
-  server.on("/api/sendFF",HTTP_POST,handleSendFF);server.on("/api/sendFE",HTTP_POST,handleSendFE);
-  server.on("/api/sendBind",HTTP_POST,handleSendBind);server.on("/api/sendUnlock",HTTP_POST,handleSendUnlock);
+  server.on("/api/saveConfig",HTTP_POST,handleSaveConfig);
+  server.on("/api/saveWifi",HTTP_POST,handleSaveWifi);
+  server.on("/api/startAdv",HTTP_POST,handleStartAdv);
+  server.on("/api/stopAdv",HTTP_POST,handleStopAdv);
+  server.on("/api/sendFF",HTTP_POST,handleSendFF);
+  server.on("/api/sendFE",HTTP_POST,handleSendFE);
+  server.on("/api/sendBind",HTTP_POST,handleSendBind);
+  server.on("/api/sendUnlock",HTTP_POST,handleSendUnlock);
   server.on("/api/sendKP",HTTP_POST,handleSendKP);
-  server.on("/api/sendRaw",HTTP_POST,handleSendRaw);server.on("/api/clearLog",HTTP_POST,handleClearLog);
-  server.on("/api/clearBonds",HTTP_POST,handleClearBonds);server.on("/api/reboot",HTTP_POST,handleReboot);
+  server.on("/api/sendRaw",HTTP_POST,handleSendRaw);
+  server.on("/api/clearLog",HTTP_POST,handleClearLog);
+  server.on("/api/clearBonds",HTTP_POST,handleClearBonds);
+  server.on("/api/reboot",HTTP_POST,handleReboot);
   server.on("/api/sendAuthResp",HTTP_POST,handleSendAuthResp);
   server.on("/api/sendNotify",HTTP_POST,handleSendNotify);
   server.onNotFound([](){if(portalMode){server.sendHeader("Location","/",true);server.send(302,"text/plain","");}else server.send(404,"text/plain","Not found");});
@@ -744,10 +694,10 @@ void serviceWiFi(){
 }
 
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r10");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r10a");
   loadSettings();
   addLog("AES key: "+bytesToHex(AES_KEY,16));
-  addLog("r10: MODE = BLE PERIPHERAL (advertising as Wyze Lock)");
+  addLog("r10a: MODE = BLE PERIPHERAL (advertising as 'Wyze Lock')");
   WiFi.disconnect(true,true);delay(200);
   beginWiFi(false);
   NimBLEDevice::init("Wyze Lock");
