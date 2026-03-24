@@ -14,6 +14,10 @@
 //  r7a: Fix NimBLE 2.x API: getConnId() removed; getCharacteristics() returns
 //       reference not pointer. Connection params now logged in onAuthenticationComplete.
 //  r7b: Fix NimBLEConnInfo: getSupervisionTimeout() -> getConnTimeout() (NimBLE 2.x).
+//  r7c: Fix setConnectTimeout() units: NimBLE 2.x takes units of 10ms, not seconds.
+//       10 -> 500 (=5s). Add post-scan settle delay (500ms) + coex settle (100ms)
+//       before connect. Increase inter-attempt delay 200->400ms to avoid EALREADY
+//       race with stale onDisconnect. dumpAllGatt() logs when not connected.
 
 #define DEBUG_SERIAL 1
 
@@ -311,7 +315,10 @@ bool isBleReady(){return bleClient&&bleClient->isConnected()&&writeChr;}
 // NimBLE 2.x: getCharacteristics() returns const ref, not pointer
 // --------------------------------------------------------------------------
 void dumpAllGatt() {
-  if(!bleClient||!bleClient->isConnected()) return;
+  if(!bleClient||!bleClient->isConnected()) {
+    addLog("GATT dump: not connected");
+    return;
+  }
   addLog("=== GATT DUMP START ===");
   const std::vector<NimBLERemoteService*> &svcs = bleClient->getServices(true);
   addLog("  Service count: " + String(svcs.size()));
@@ -474,7 +481,9 @@ bool tryConnect(const NimBLEAddress &addr,const char *label){
   bleClient=NimBLEDevice::createClient();
   bleClient->setClientCallbacks(&gClientCB,false);
   bleClient->setConnectionParams(24,40,0,400);
-  bleClient->setConnectTimeout(10);
+  // r7c: NimBLE 2.x setConnectTimeout() unit is 10ms, NOT seconds.
+  //      500 * 10ms = 5 seconds. Old value of 10 = 100ms caused instant ETIMEOUT.
+  bleClient->setConnectTimeout(500);
   addLog(String(label)+": connecting to "+String(addr.toString().c_str())+" type="+String(addr.getType()));
   bool ok=bleClient->connect(addr,false);
   int le=bleClient->getLastError();
@@ -495,15 +504,20 @@ bool connectBle(){
   String typeStr=(gFoundAddrType==BLE_ADDR_RANDOM)?"random":"public";
   if(settings.bleAddrType!=typeStr){settings.bleAddrType=typeStr;saveSettings();addLog("addrType corrected to "+typeStr);}
 
-  delay(100);
+  // r7c: Allow controller to fully settle after scan before switching coex and connecting.
+  //      Old 100ms was insufficient; 500ms post-scan + 100ms post-coex-switch.
+  delay(500);
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
+  delay(100);
 
   ble_addr_t bleAddr;bleAddr.type=gFoundAddrType;memcpy(bleAddr.val,gFoundAddrBytes,6);
   NimBLEAddress peerAddr(bleAddr);
   addLog("Attempt 1: "+String(peerAddr.toString().c_str())+" type="+String(peerAddr.getType()));
   bool ok=tryConnect(peerAddr,"Attempt1");
   if(!ok){
-    deleteBleClient();delay(200);
+    // r7c: Increased delay 200->400ms to let stale onDisconnect event drain
+    //      before creating a new client, avoiding BLE_HS_EALREADY race.
+    deleteBleClient();delay(400);
     char addrStr[18];
     snprintf(addrStr,sizeof(addrStr),"%02x:%02x:%02x:%02x:%02x:%02x",
              gFoundAddrBytes[5],gFoundAddrBytes[4],gFoundAddrBytes[3],
@@ -663,7 +677,7 @@ void serviceBleAutoConnect(){
 }
 
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r7b");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r7c");
   loadSettings();
   addLog("addr="+settings.bleAddress+" storedType="+settings.bleAddrType);
   addLog("svc="+settings.serviceUuid);
