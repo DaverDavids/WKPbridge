@@ -11,6 +11,8 @@
 //      Richer mfr data decode (device type, pairing/lock status, MAC).
 //      Added /api/sendBind, /api/sendUnlock, /api/sendKP endpoints.
 //      Connection params logged. Log buffer expanded to 24KB.
+//  r7a: Fix NimBLE 2.x API: getConnId() removed; getCharacteristics() returns
+//       reference not pointer. Connection params now logged in onAuthenticationComplete.
 
 #define DEBUG_SERIAL 1
 
@@ -138,11 +140,11 @@ NimBLERemoteCharacteristic *notifyChr = nullptr;
 //   0x02 = keypress test
 // Byte[5] = sub-command / payload length
 // Bytes[6-7] = 0x1E F1 (checksum placeholder - may need real checksum)
-static const uint8_t PKT_FF[8]   = {0xDE,0xC0,0xAD,0xDE,0xFF,0x01,0x1E,0xF1}; // probe
-static const uint8_t PKT_FE[8]   = {0xDE,0xC0,0xAD,0xDE,0xFE,0x01,0x1E,0xF1}; // probe alt
-static const uint8_t PKT_BIND[8] = {0xDE,0xC0,0xAD,0xDE,0x01,0x1E,0xF1,0x00}; // bind
+static const uint8_t PKT_FF[8]    = {0xDE,0xC0,0xAD,0xDE,0xFF,0x01,0x1E,0xF1}; // probe
+static const uint8_t PKT_FE[8]    = {0xDE,0xC0,0xAD,0xDE,0xFE,0x01,0x1E,0xF1}; // probe alt
+static const uint8_t PKT_BIND[8]  = {0xDE,0xC0,0xAD,0xDE,0x01,0x1E,0xF1,0x00}; // bind
 static const uint8_t PKT_UNLOCK[8]= {0xDE,0xC0,0xAD,0xDE,0x00,0x01,0x1E,0xF1}; // unlock
-static const uint8_t PKT_KP[8]   = {0xDE,0xC0,0xAD,0xDE,0x02,0x01,0x1E,0xF1}; // keypress
+static const uint8_t PKT_KP[8]    = {0xDE,0xC0,0xAD,0xDE,0x02,0x01,0x1E,0xF1}; // keypress
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -169,7 +171,7 @@ String bytesToHex(const uint8_t *d,size_t l){
   for(size_t i=0;i<l;i++){o+=h[(d[i]>>4)&0xF];o+=h[d[i]&0xF];if(i+1<l)o+=' ';} return o;
 }
 bool parseHexString(String s,std::vector<uint8_t>&out){
-  out.clear();s.replace("0x","");s.replace("0X","");s.replace(","," ");s.replace(":"," ");s.replace("-"," ");
+  out.clear();s.replace("0x","");s.replace("0X","");s.replace(",","");s.replace(":"," ");s.replace("-"," ");
   while(s.indexOf("  ")>=0)s.replace("  "," ");s.trim();if(s.isEmpty())return false;
   int st=0;
   while(st<(int)s.length()){
@@ -248,16 +250,8 @@ void serviceMQTT(){}
 class ClientCB : public NimBLEClientCallbacks {
 public:
   void onConnect(NimBLEClient *c) override {
+    // NimBLE 2.x: getConnId() is removed; conn params come via NimBLEConnInfo
     addLog("BLE onConnect: "+String(c->getPeerAddress().toString().c_str()));
-    // Log connection parameters
-    ble_gap_conn_desc desc;
-    if(ble_gap_conn_find(c->getConnId(), &desc) == 0) {
-      addLog("  connParams itvl=" + String(desc.conn_itvl) +
-             " latency=" + String(desc.conn_latency) +
-             " supervision=" + String(desc.supervision_timeout) +
-             " ownAddrType=" + String(desc.our_id_addr.type) +
-             " peerAddrType=" + String(desc.peer_id_addr.type));
-    }
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
   void onConnectFail(NimBLEClient *c, int reason) override {
@@ -270,8 +264,14 @@ public:
     addLog("BLE onDisconnect reason=0x"+String(reason,HEX));
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
+  // NimBLE 2.x: onAuthenticationComplete receives NimBLEConnInfo which has conn params
   void onAuthenticationComplete(NimBLEConnInfo &i) override {
     addLog("BLE auth: enc="+String(i.isEncrypted())+" bonded="+String(i.isBonded())+" auth="+String(i.isAuthenticated()));
+    // Log connection interval in 1.25ms units, latency, supervision timeout in 10ms units
+    addLog("  connInfo itvl="+String(i.getConnInterval())
+           +" latency="+String(i.getConnLatency())
+           +" supervision="+String(i.getSupervisionTimeout())
+           +" mtu="+String(i.getMTU()));
   }
 };
 ClientCB gClientCB;
@@ -305,6 +305,7 @@ bool isBleReady(){return bleClient&&bleClient->isConnected()&&writeChr;}
 
 // --------------------------------------------------------------------------
 // Full GATT dump: log all services + characteristics + properties
+// NimBLE 2.x: getCharacteristics() returns const reference, not pointer
 // --------------------------------------------------------------------------
 void dumpAllGatt() {
   if(!bleClient||!bleClient->isConnected()) return;
@@ -314,9 +315,9 @@ void dumpAllGatt() {
   for(NimBLERemoteService *svc : svcs) {
     String svcUuid = String(svc->getUUID().toString().c_str());
     addLog("  SVC: " + svcUuid);
-    const std::vector<NimBLERemoteCharacteristic*> *chars = svc->getCharacteristics(true);
-    if(!chars) continue;
-    for(NimBLERemoteCharacteristic *ch : *chars) {
+    // NimBLE 2.x: getCharacteristics() returns const std::vector<...>& (reference, not pointer)
+    const std::vector<NimBLERemoteCharacteristic*> &chars = svc->getCharacteristics(true);
+    for(NimBLERemoteCharacteristic *ch : chars) {
       String props = "";
       if(ch->canRead())            props += "R";
       if(ch->canWrite())           props += "W";
@@ -703,7 +704,7 @@ void serviceBleAutoConnect(){
 }
 
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r7");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r7a");
   loadSettings();
   addLog("addr="+settings.bleAddress+" storedType="+settings.bleAddrType);
   addLog("svc="+settings.serviceUuid);
