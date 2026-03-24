@@ -1,13 +1,11 @@
 // WKPbridge.ino
 // ESP32-C3 BLE-to-WiFi bridge for Wyze Wireless Keypad (WLCKKP1)
 //
-// Fixes applied 2026-03-24:
-//  1. Security set to NO-BOND / NO-PAIRING  (nRF Connect shows "NOT BONDED" on successful connect)
-//  2. secureConnection() call removed        (device does not encrypt)
-//  3. BLE coex priority raised BEFORE connect() not just during scan
-//  4. Default UUIDs pre-set to Nordic UART Service (confirmed by nRF Connect screenshot)
-//  5. Manufacturer-data fallback scan match on Wyze Company ID 0x4459
-//  6. connect() args corrected: deleteAttrs=false so attr cache is preserved
+// Fix log:
+//  2026-03-24 r1: Security=NO-BOND, remove secureConnection(), coex before connect,
+//                 NUS UUIDs as defaults, Wyze mfr-data scan fallback
+//  2026-03-24 r2: Fix 0x0D - always use addrType from live scan result, not stored setting
+//                 (UI stored 'public' but device advertises as random type=1)
 
 #define DEBUG_SERIAL 1
 
@@ -52,7 +50,7 @@ struct Settings {
   String  wifiSsid;
   String  wifiPsk;
   String  bleAddress;
-  String  bleAddrType;
+  String  bleAddrType;     // stored for UI display only; connect uses live scan type
   String  bleName;
   String  serviceUuid;
   String  writeUuid;
@@ -262,7 +260,6 @@ public:
     addLog("BLE onDisconnect: reason=0x"+String(reason, HEX));
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
-  // Auth callbacks kept for logging only - we do not initiate pairing
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
     addLog("BLE auth complete: encrypted="+String(connInfo.isEncrypted())
            +" bonded="+String(connInfo.isBonded())
@@ -355,11 +352,15 @@ String scanJson() {
 
 // --------------------------------------------------------------------------
 // BLE connect
-// FIX: Wyze keypad connects WITHOUT bonding/encryption (confirmed by nRF Connect).
-//      - Removed BLE_SM_PAIR_AUTHREQ_BOND from security flags in setup()
-//      - Removed secureConnection() call here
-//      - Raised BLE coex priority BEFORE connect(), not just during scan
-//      - connect() called with deleteAttrs=false to preserve service cache
+//
+// ROOT CAUSE OF 0x0D ERROR:
+//   settings.bleAddrType was saved as "public" from the UI while the device
+//   actually advertises as BLE_ADDR_RANDOM (type=1). The NimBLE HCI layer
+//   rejects the connection attempt when addr type is wrong (error 0x0d).
+//
+// FIX: Use address type directly from the live NimBLEAdvertisedDevice scan
+//   result. Also auto-correct settings.bleAddrType so the UI stays accurate.
+//   The stored bleAddrType is now only used for UI display, never for connect.
 // --------------------------------------------------------------------------
 bool connectBle() {
   deleteBleClient();
@@ -377,26 +378,35 @@ bool connectBle() {
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
 
-  addLog("Connecting to "+String(found->getAddress().toString().c_str())
-         +" addrType="+String(found->getAddress().getType()));
+  // FIX: Read address type from the scan result directly (NOT from settings)
+  uint8_t scannedAddrType = found->getAddress().getType();
+  String scannedAddrTypeStr = (scannedAddrType == BLE_ADDR_RANDOM) ? "random" : "public";
 
-  // FIX: boost BLE coex priority for the connect window (WiFi was racing connect)
+  // Auto-correct stored setting if it disagrees with scan reality
+  if(settings.bleAddrType != scannedAddrTypeStr) {
+    addLog("addrType mismatch: stored='" + settings.bleAddrType +
+           "' scan='" + scannedAddrTypeStr + "' -> correcting");
+    settings.bleAddrType = scannedAddrTypeStr;
+    saveSettings();
+  }
+
+  addLog("Connecting to " + String(found->getAddress().toString().c_str())
+         + " addrType=" + String(scannedAddrType) + " (" + scannedAddrTypeStr + ")");
+
+  // Boost BLE coex priority for the connect window
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
 
-  bleClient=NimBLEDevice::createClient();
+  bleClient = NimBLEDevice::createClient();
   bleClient->setClientCallbacks(&gClientCB, false);
   bleClient->setConnectionParams(24, 40, 0, 400);
-  bleClient->setConnectTimeout(10);  // 10s is plenty; 15s was causing timeout loops
+  bleClient->setConnectTimeout(10);
 
-  // FIX: pass deleteAttrs=false (was true) to keep attribute cache across reconnects
+  // connect() using the found device object - NimBLE uses the device's own addrType internally
   if(!bleClient->connect(found, false, false, false)) {
     addLog("connect() failed lastErr=0x"+String(bleClient->getLastError(), HEX));
     deleteBleClient(); esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
   addLog("Link up — no pairing required (device connects unencrypted)");
-
-  // FIX: Do NOT call secureConnection() - WLCKKP1 is NOT BONDED per nRF Connect observation
-  // Calling it would cause a pairing attempt the device rejects, killing the link.
 
   bleClient->exchangeMTU();
   addLog("MTU="+String(bleClient->getMTU()));
@@ -583,7 +593,7 @@ void serviceBleAutoConnect(){
 void setup(){
   DBG_BEGIN(115200); delay(200); addLog("Boot");
   loadSettings();
-  addLog("addr="+settings.bleAddress+" type="+settings.bleAddrType);
+  addLog("addr="+settings.bleAddress+" storedType="+settings.bleAddrType);
   addLog("svc="+settings.serviceUuid+" wr="+settings.writeUuid);
 
   WiFi.disconnect(true,true); delay(200);
@@ -594,9 +604,7 @@ void setup(){
   NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
   addLog("Own addr: "+String(NimBLEDevice::getAddress().toString().c_str()));
 
-  // FIX: WLCKKP1 does NOT bond or encrypt - observed as "NOT BONDED" in nRF Connect.
-  // Setting BOND flag causes the stack to wait for a pairing response that never comes.
-  // Use security flags = 0 (no requirements) so connect() completes immediately.
+  // WLCKKP1 does NOT bond or encrypt - connect as no-security
   NimBLEDevice::setSecurityAuth(0);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
