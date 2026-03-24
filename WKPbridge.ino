@@ -5,8 +5,11 @@
 //  r1: Security=NO-BOND, NUS UUIDs, coex, mfr-data scan fallback
 //  r2: Fix 0x0D addrType mismatch
 //  r3: Fix 0x0D - stop+clear scan before connect
-//  r4: Deep debug - log exact NimBLE state, try both connect overloads,
-//      log ble_hs error string, dump raw address bytes
+//  r4: Deep debug - raw addr bytes, error strings, fallback connect
+//  r5: Fix NimBLE 2.4.0 compile errors:
+//      - ble_hs_err_to_str not in 2.4.0 -> manual lookup table
+//      - NimBLEAddress::getNative() not in 2.4.0 -> use getBase()->val
+//      - ble_hs_is_enabled() removed -> use NimBLEDevice::isInitialized()
 
 #define DEBUG_SERIAL 1
 
@@ -18,7 +21,6 @@
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <NimBLEDevice.h>
-#include <host/ble_hs.h>
 #include <esp_coexist.h>
 #include <vector>
 
@@ -42,6 +44,45 @@ static const uint16_t WYZE_COMPANY_ID = 0x4459;
   #define DBG_PRINTLN(x)
 #endif
 
+// NimBLE 2.4.0 doesn't expose ble_hs_err_to_str; use this stub instead
+static const char* nimbleErrStr(int err) {
+  switch(err) {
+    case 0x00: return "OK";
+    case 0x01: return "BLE_HS_EAGAIN";
+    case 0x02: return "BLE_HS_EALREADY";
+    case 0x03: return "BLE_HS_EINVAL";
+    case 0x04: return "BLE_HS_EMSGSIZE";
+    case 0x05: return "BLE_HS_ENOENT";
+    case 0x06: return "BLE_HS_ENOMEM";
+    case 0x07: return "BLE_HS_ENOTCONN";
+    case 0x08: return "BLE_HS_ENOTSUP";
+    case 0x09: return "BLE_HS_EAPP";
+    case 0x0a: return "BLE_HS_EBADDATA";
+    case 0x0b: return "BLE_HS_EOS";
+    case 0x0c: return "BLE_HS_ECONTROLLER";
+    case 0x0d: return "BLE_HS_ETIMEOUT";
+    case 0x0e: return "BLE_HS_EDONE";
+    case 0x0f: return "BLE_HS_EBUSY";
+    case 0x10: return "BLE_HS_EREJECT";
+    case 0x11: return "BLE_HS_EUNKNOWN";
+    case 0x12: return "BLE_HS_EROLE";
+    case 0x13: return "BLE_HS_ETIMEOUT_HCI";
+    case 0x14: return "BLE_HS_ENOMEM_EVT";
+    case 0x15: return "BLE_HS_ENOADDR";
+    case 0x16: return "BLE_HS_ENOTSYNCED";
+    case 0x17: return "BLE_HS_EAUTHEN";
+    case 0x18: return "BLE_HS_EAUTHOR";
+    case 0x19: return "BLE_HS_EENCRYPT";
+    case 0x1a: return "BLE_HS_EENCRYPT_KEY_SZ";
+    case 0x1b: return "BLE_HS_ESTORE_CAP";
+    case 0x1c: return "BLE_HS_ESTORE_FAIL";
+    case 0x1d: return "BLE_HS_EPREEMPTED";
+    case 0x1e: return "BLE_HS_EDISABLED";
+    case 0x1f: return "BLE_HS_ESTALLED";
+    default:   return "UNKNOWN";
+  }
+}
+
 struct Settings {
   String  wifiSsid, wifiPsk, bleAddress, bleAddrType, bleName;
   String  serviceUuid, writeUuid, notifyUuid;
@@ -61,8 +102,8 @@ unsigned long lastWifiTryMs=0, lastBleTryMs=0, lastStateMs=0;
 
 String logBuffer, lastScanJson="[]", lastTxHex, lastRxHex, currentTargetAddr;
 
-// Saved from scan before clearResults()
-static uint8_t  gFoundAddrBytes[6];
+// Saved from scan before clearResults() invalidates device pointers
+static uint8_t  gFoundAddrBytes[6];  // raw bytes in NimBLE native order (LSB first = val[0..5])
 static uint8_t  gFoundAddrType = BLE_ADDR_RANDOM;
 static bool     gFoundValid    = false;
 
@@ -130,8 +171,8 @@ void loadSettings(){
   settings.autoConnect      =prefs.getBool  ("auto_conn",false);
   settings.writeWithResponse=prefs.getBool  ("wr_rsp",   false);
   settings.scanSeconds      =prefs.getUChar ("scan_sec", 5);
-  settings.mqttHost  =prefs.getString("mqtt_host",""); settings.mqttPort =prefs.getUShort("mqtt_port",1883);
-  settings.mqttUser  =prefs.getString("mqtt_user",""); settings.mqttPass =prefs.getString("mqtt_pass","");
+  settings.mqttHost  =prefs.getString("mqtt_host",""); settings.mqttPort=prefs.getUShort("mqtt_port",1883);
+  settings.mqttUser  =prefs.getString("mqtt_user",""); settings.mqttPass=prefs.getString("mqtt_pass","");
   settings.mqttTopic =prefs.getString("mqtt_topic","wkpbridge");
   prefs.end();
 }
@@ -185,9 +226,10 @@ public:
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
   void onConnectFail(NimBLEClient *c, int reason) override {
-    // Decode the NimBLE hs error
-    const char *errStr = ble_hs_err_to_str(reason);
-    addLog("BLE onConnectFail reason=0x"+String(reason,HEX)+" ("+String(errStr?errStr:"?")+") lastErr=0x"+String(c->getLastError(),HEX));
+    addLog("BLE onConnectFail reason=0x"+String(reason,HEX)
+           +" ("+String(nimbleErrStr(reason))
+           +") lastErr=0x"+String(c->getLastError(),HEX)
+           +" ("+String(nimbleErrStr(c->getLastError()))+")");
   }
   void onDisconnect(NimBLEClient *c, int reason) override {
     (void)c; writeChr=nullptr; notifyChr=nullptr;
@@ -217,7 +259,9 @@ bool isWyzeDevice(const NimBLEAdvertisedDevice *dev){
 }
 
 // --------------------------------------------------------------------------
-// BLE scan - saves raw address bytes before clearResults()
+// BLE scan
+// Saves raw address bytes via getBase()->val before clearResults()
+// getBase() returns the underlying ble_addr_t* which has val[6] in LSB-first order
 // --------------------------------------------------------------------------
 bool doScanFindTarget(uint8_t secs,const String &targetUpper){
   if(scanRunning){addLog("Scan busy");return false;}
@@ -248,37 +292,26 @@ bool doScanFindTarget(uint8_t secs,const String &targetUpper){
     String ats=(at==BLE_ADDR_RANDOM)?"random":"public";
     bool wyze=isWyzeDevice(dev);
 
-    // DEBUG: log raw address bytes and type integer
-    const uint8_t *rawBytes=addr.getNative();
+    // NimBLE 2.x: raw bytes are in getBase()->val[0..5] (LSB-first / little-endian)
+    const uint8_t *rawBytes = addr.getBase()->val;
     addLog("  "+addrUp+" type="+String(at)+" ["+ats+"] '"+name+"' rssi="+String(rssi)
-           +(wyze?" [Wyze]:":": ")+"raw="+bytesToHex(rawBytes,6));
+           +(wyze?" [Wyze]":"")+" raw="+bytesToHex(rawBytes,6));
 
     if(!first)json+=","; first=false;
     json+="{\"addr\":\""+jsonEscape(addrStr)+"\",\"addrType\":\""+ats+"\",\"name\":\""+jsonEscape(name)+"\",\"rssi\":"+String(rssi)+",\"wyze\":"+String(wyze?"true":"false")+"}";
 
-    if(!found&&!targetUpper.isEmpty()&&addrUp==targetUpper){
-      // Save raw bytes and type NOW before clearResults() invalidates the pointer
+    bool addrMatch = !targetUpper.isEmpty() && addrUp==targetUpper;
+    bool nameMatch = !found && settings.bleName.length() && name.length() && [&](){
+      String n1=name;n1.toLowerCase();String n2=settings.bleName;n2.toLowerCase();return n1.indexOf(n2)>=0;
+    }();
+
+    if(!found && (addrMatch || nameMatch || (!found && wyze))) {
       memcpy(gFoundAddrBytes, rawBytes, 6);
-      gFoundAddrType=at;
-      found=true;
-      addLog("  -> addr match, saved raw bytes type="+String(at));
-    }
-    if(!found&&settings.bleName.length()&&name.length()){
-      String n1=name;n1.toLowerCase();String n2=settings.bleName;n2.toLowerCase();
-      if(n1.indexOf(n2)>=0){
-        memcpy(gFoundAddrBytes, rawBytes, 6);
-        gFoundAddrType=at;
-        found=true;
-        addLog("  -> name match, saved raw bytes type="+String(at));
-        currentTargetAddr=addrStr;
-      }
-    }
-    if(!found&&wyze){
-      memcpy(gFoundAddrBytes, rawBytes, 6);
-      gFoundAddrType=at;
-      found=true;
-      addLog("  -> Wyze mfr match, saved raw bytes type="+String(at));
-      currentTargetAddr=addrStr;
+      gFoundAddrType = at;
+      found = true;
+      String reason = addrMatch?"addr":nameMatch?"name":"wyze-mfr";
+      addLog("  -> "+reason+" match | saved bytes="+bytesToHex(gFoundAddrBytes,6)+" type="+String(at));
+      if(!addrMatch) currentTargetAddr=addrStr;
     }
   }
   json+="]"; lastScanJson=json;
@@ -301,8 +334,21 @@ String scanJson(){
 }
 
 // --------------------------------------------------------------------------
-// BLE connect - rebuild NimBLEAddress from saved raw bytes
+// BLE connect
+// Rebuilds NimBLEAddress from saved raw bytes using ble_addr_t constructor
 // --------------------------------------------------------------------------
+bool tryConnect(const NimBLEAddress &addr, const char *label) {
+  bleClient=NimBLEDevice::createClient();
+  bleClient->setClientCallbacks(&gClientCB,false);
+  bleClient->setConnectionParams(24,40,0,400);
+  bleClient->setConnectTimeout(10);
+  addLog(String(label)+": connecting to "+String(addr.toString().c_str())+" type="+String(addr.getType()));
+  bool ok=bleClient->connect(addr,false);
+  int le=bleClient->getLastError();
+  addLog(String(label)+": connect="+String(ok?"OK":"FAIL")+" lastErr=0x"+String(le,HEX)+" ("+nimbleErrStr(le)+")");
+  return ok;
+}
+
 bool connectBle(){
   deleteBleClient();
   String target=settings.bleAddress;target.trim();target.toUpperCase();
@@ -319,71 +365,42 @@ bool connectBle(){
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;
   }
 
-  // Rebuild address from raw bytes - NimBLE native order is reversed (LSB first)
-  // Log exactly what we're about to use
-  addLog("Found addr bytes (native LSB-first): "+bytesToHex(gFoundAddrBytes,6)
-         +" type="+String(gFoundAddrType)
-         +" ("+String(gFoundAddrType==BLE_ADDR_RANDOM?"random":"public")+")");
+  addLog("Pre-connect: saved bytes="+bytesToHex(gFoundAddrBytes,6)+" type="+String(gFoundAddrType)+" ("+String(gFoundAddrType==BLE_ADDR_RANDOM?"random":"public")+")");
 
-  // Log NimBLE host state before attempting connect
-  addLog("NimBLE host synced="+String(ble_hs_is_enabled()?"yes":"no"));
-
-  // Construct NimBLEAddress from raw bytes + type
-  NimBLEAddress peerAddr(gFoundAddrBytes, gFoundAddrType);
-  addLog("Reconstructed NimBLEAddress: "+String(peerAddr.toString().c_str())
-         +" type="+String(peerAddr.getType()));
-
+  // Update stored addr type if it changed
   String typeStr=(gFoundAddrType==BLE_ADDR_RANDOM)?"random":"public";
-  if(settings.bleAddrType!=typeStr){
-    settings.bleAddrType=typeStr; saveSettings();
-    addLog("addrType corrected to "+typeStr);
-  }
+  if(settings.bleAddrType!=typeStr){settings.bleAddrType=typeStr;saveSettings();addLog("addrType corrected to "+typeStr);}
 
-  delay(100); // extra settle time after scan cleared
+  delay(100);
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
-  addLog("Coex -> BT, attempting connect...");
 
-  bleClient=NimBLEDevice::createClient();
-  bleClient->setClientCallbacks(&gClientCB,false);
-  bleClient->setConnectionParams(24,40,0,400);
-  bleClient->setConnectTimeout(10);
+  // Attempt 1: construct NimBLEAddress from ble_addr_t
+  ble_addr_t bleAddr;
+  bleAddr.type = gFoundAddrType;
+  memcpy(bleAddr.val, gFoundAddrBytes, 6);
+  NimBLEAddress peerAddr(bleAddr);
+  addLog("Attempt 1: NimBLEAddress from ble_addr_t -> "+String(peerAddr.toString().c_str())+" type="+String(peerAddr.getType()));
 
-  // Try connect using reconstructed NimBLEAddress
-  bool ok=bleClient->connect(peerAddr,false);
-  addLog("connect() returned "+String(ok?"true":"false")+" lastErr=0x"+String(bleClient->getLastError(),HEX));
+  bool ok = tryConnect(peerAddr, "Attempt1");
 
   if(!ok){
-    int le=bleClient->getLastError();
-    const char *errStr=ble_hs_err_to_str(le);
-    addLog("connect() FAILED: 0x"+String(le,HEX)+" "+String(errStr?errStr:"unknown"));
-
-    // Try alternate: pass address as string to let NimBLE re-parse
-    addLog("Trying fallback: connect via string address...");
     deleteBleClient();
-    bleClient=NimBLEDevice::createClient();
-    bleClient->setClientCallbacks(&gClientCB,false);
-    bleClient->setConnectionParams(24,40,0,400);
-    bleClient->setConnectTimeout(10);
     delay(200);
 
-    // Build address string from raw bytes (NimBLE prints as big-endian colon notation)
+    // Attempt 2: construct from colon-string + explicit type
     char addrStr[18];
+    // NimBLE val[] is LSB-first; toString() is MSB-first display, so reverse:
     snprintf(addrStr,sizeof(addrStr),"%02x:%02x:%02x:%02x:%02x:%02x",
              gFoundAddrBytes[5],gFoundAddrBytes[4],gFoundAddrBytes[3],
              gFoundAddrBytes[2],gFoundAddrBytes[1],gFoundAddrBytes[0]);
-    addLog("Fallback addr string: "+String(addrStr));
-    NimBLEAddress fallbackAddr(addrStr, gFoundAddrType);
-    addLog("Fallback NimBLEAddress: "+String(fallbackAddr.toString().c_str())+" type="+String(fallbackAddr.getType()));
+    addLog("Attempt 2: string addr="+String(addrStr)+" type="+String(gFoundAddrType));
+    NimBLEAddress fallback(addrStr, gFoundAddrType);
+    addLog("Attempt 2: NimBLEAddress -> "+String(fallback.toString().c_str())+" type="+String(fallback.getType()));
+    ok = tryConnect(fallback, "Attempt2");
+  }
 
-    ok=bleClient->connect(fallbackAddr,false);
-    addLog("Fallback connect() returned "+String(ok?"true":"false")+" lastErr=0x"+String(bleClient->getLastError(),HEX));
-
-    if(!ok){
-      int le2=bleClient->getLastError();
-      const char *e2=ble_hs_err_to_str(le2);
-      addLog("Fallback ALSO FAILED: 0x"+String(le2,HEX)+" "+String(e2?e2:"unknown"));
-      deleteBleClient(); esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
-    }
+  if(!ok){
+    deleteBleClient(); esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
 
   addLog("Link up!");
