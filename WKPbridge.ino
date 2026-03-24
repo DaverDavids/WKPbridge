@@ -25,17 +25,20 @@
 //       Added extensive debug logging throughout connect/callback path.
 //  r8:  Decompile analysis conclusions:
 //       - Transport is NUS (6e400001/02/03), NOT 0xFE50/FE51/FE52.
-//         FE50 services are absent from the GATT dump; NUS is the real channel.
 //       - Default UUIDs switched to NUS. Stored settings migrated on boot.
-//       - Removed updateConnParams() call: keypad advertises preferred itvl=6-8
-//         (7.5-10ms); our 12/12 params were out of range and causing instability.
-//         The keypad negotiates its own params after connection -- let it.
-//       - Auto-probe on connect: immediately after subscribing notify, send PKT_FF
-//         (DE C0 AD DE FF 01 1E F1) to kick off the GET_RANDOM handshake.
-//         Without this the keypad disconnects with HCI 0x13 after ~8s timeout
-//         because the expected post-connect challenge never arrives.
-//       - All RX is logged verbatim so we can decode the GET_RANDOM response
-//         format on the next capture.
+//       - Removed updateConnParams() call.
+//       - Auto-probe on connect: send PKT_FF after subscribing notify.
+//  r9:  Decompile deep-dive -- AES-ECB auth handshake:
+//       - Hardcoded key at 0x00036df0: "d37fcd6903fe6e69" (8 ASCII bytes / 16 hex = 8 bytes raw)
+//         Actual key bytes: 0xD3,0x7F,0xCD,0x69,0x03,0xFE,0x6E,0x69 padded to 16 bytes.
+//         NOTE: the string is ASCII hex representation -- "d37fcd6903fe6e69" decoded as hex.
+//       - FUN_00028158: AES-ECB 16-byte block encrypt/decrypt (mbedtls on ESP32).
+//       - FUN_000334ec / FUN_00033508: send 8-byte encrypted response.
+//       - FUN_0002f9bc state machine: keypad sends nonce first (8 bytes), we encrypt + reply.
+//       - REMOVED PKT_FF auto-probe: it was wrong. Keypad initiates -- we must wait silently.
+//       - notifyCB: auto-detect 8-byte nonce -> AES-ECB encrypt -> send 8-byte auth response.
+//       - Added /api/sendAuthResp (manual auth with last stored nonce).
+//       - Added /api/sendGetRandom (manual GET_RANDOM trigger if needed).
 
 #define DEBUG_SERIAL 1
 
@@ -50,6 +53,9 @@
 #include <esp_coexist.h>
 #include <vector>
 
+// mbedTLS AES for the keypad auth handshake
+#include "mbedtls/aes.h"
+
 #include <Secrets.h>
 #include "html.h"
 
@@ -58,8 +64,6 @@ static const char *AP_SSID  = "WKPbridge-setup";
 static const byte DNS_PORT  = 53;
 
 // ---- Transport UUIDs (Nordic UART Service - confirmed via GATT dump) -----
-// r8: Keypad uses NUS as its transport layer (dd_protocol frames over NUS).
-//     0xFE50 service is NOT present; NUS is the only viable channel.
 static const char *NUS_SERVICE_UUID   = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 static const char *NUS_RX_UUID        = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";  // we write here
 static const char *NUS_TX_UUID        = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";  // keypad notifies here
@@ -74,6 +78,17 @@ static const uint16_t WYZE_COMPANY_ID = 0x4459;  // 'DY' little-endian
 static const char * const WYZE_ADV_NAMES[] = {
   "Wyze Lock", "DingDing", "KP-01", "DD-Fact", nullptr
 };
+
+// ---- AES-ECB auth key (decompile 0x00036df0: "d37fcd6903fe6e69" as ASCII hex) ----
+// Decoded: D3 7F CD 69 03 FE 6E 69, zero-padded to 16 bytes for AES-128
+static const uint8_t AES_KEY[16] = {
+  0xD3, 0x7F, 0xCD, 0x69, 0x03, 0xFE, 0x6E, 0x69,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+// ---- dd_protocol nonce storage (8 bytes from keypad) ----
+static uint8_t  gLastNonce[8]     = {0};
+static bool     gNonceReceived    = false;
 
 #if DEBUG_SERIAL
   #define DBG_BEGIN(x)    Serial.begin(x)
@@ -148,15 +163,42 @@ NimBLEClient               *bleClient = nullptr;
 NimBLERemoteCharacteristic *writeChr  = nullptr;
 NimBLERemoteCharacteristic *notifyChr = nullptr;
 
-// ---- Packet presets (dd_protocol framing over NUS) -----------------------
-// Magic: DE C0 AD DE  ("DEAD C0DE" reversed)
-// r8: PKT_FF is the initial probe / GET_RANDOM trigger sent right after
-//     subscribing notify. Without it the keypad times out (HCI 0x13 ~8s).
+// ---- Packet presets -------------------------------------------------------
+// dd_protocol opcodes from decompile strings:
+//   MSG_KEYPAD_GET_RANDOM  = 0x?? (keypad->host nonce challenge)
+//   MSG_KEYPAD_BIND        = 0x01
+//   MSG_KEYPAD_UNLOCK      = 0x00
+//   MSG_KEYPAD_PRESS       = 0x02
+// Auth response: AES-ECB(nonce, key) first 8 bytes
 static const uint8_t PKT_FF[8]    = {0xDE,0xC0,0xAD,0xDE,0xFF,0x01,0x1E,0xF1};
 static const uint8_t PKT_FE[8]    = {0xDE,0xC0,0xAD,0xDE,0xFE,0x01,0x1E,0xF1};
 static const uint8_t PKT_BIND[8]  = {0xDE,0xC0,0xAD,0xDE,0x01,0x1E,0xF1,0x00};
 static const uint8_t PKT_UNLOCK[8]= {0xDE,0xC0,0xAD,0xDE,0x00,0x01,0x1E,0xF1};
 static const uint8_t PKT_KP[8]    = {0xDE,0xC0,0xAD,0xDE,0x02,0x01,0x1E,0xF1};
+
+// --------------------------------------------------------------------------
+// AES-ECB auth response
+// Input: 8-byte nonce from keypad
+// Output: 8-byte response = first 8 bytes of AES-128-ECB(nonce padded to 16, key)
+// --------------------------------------------------------------------------
+bool computeAuthResponse(const uint8_t *nonce8, uint8_t *resp8) {
+  uint8_t block[16] = {0};
+  memcpy(block, nonce8, 8);  // pad remaining 8 bytes with zero
+
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  int ret = mbedtls_aes_setkey_enc(&aes, AES_KEY, 128);
+  if(ret != 0) {
+    mbedtls_aes_free(&aes);
+    return false;
+  }
+  uint8_t out[16] = {0};
+  ret = mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, block, out);
+  mbedtls_aes_free(&aes);
+  if(ret != 0) return false;
+  memcpy(resp8, out, 8);
+  return true;
+}
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -165,9 +207,9 @@ String jsonEscape(const String &in) {
   String out; out.reserve(in.length()+16);
   for(size_t i=0;i<in.length();i++){
     char c=in[i]; switch(c){
-      case '\\': out+="\\\\"; break; case '"': out+="\\\""; break;
-      case '\n': out+="\\n";  break; case '\r': break;
-      case '\t': out+="\\t";  break;
+      case '\\': out+="\\\\"  ; break; case '"': out+="\\\""; break;
+      case '\n': out+="\\n";   break; case '\r': break;
+      case '\t': out+="\\t";   break;
       default: if((uint8_t)c<32)out+=' '; else out+=c; break;
     }
   }
@@ -208,7 +250,6 @@ void loadSettings(){
   settings.bleAddress  =prefs.getString("ble_addr", "");
   settings.bleAddrType =prefs.getString("ble_atype","random");
   settings.bleName     =prefs.getString("ble_name", "KP-01");
-  // r8: Migrate stored UUID to NUS if it was the old Wyze FE50 default
   settings.serviceUuid =prefs.getString("svc_uuid", NUS_SERVICE_UUID);
   settings.writeUuid   =prefs.getString("wr_uuid",  NUS_RX_UUID);
   settings.notifyUuid  =prefs.getString("nt_uuid",  NUS_TX_UUID);
@@ -219,17 +260,14 @@ void loadSettings(){
   settings.mqttUser=prefs.getString("mqtt_user","");settings.mqttPass=prefs.getString("mqtt_pass","");
   settings.mqttTopic=prefs.getString("mqtt_topic","wkpbridge");
   prefs.end();
-  // Migrate: if stored UUIDs are still the old FE50 values, reset to NUS
+  // Migrate: FE50 -> NUS
   if(settings.serviceUuid == WYZE_SERVICE_UUID) {
-    addLog("r8 migrate: resetting UUIDs from FE50 -> NUS");
+    addLog("r9 migrate: resetting UUIDs from FE50 -> NUS");
     settings.serviceUuid = NUS_SERVICE_UUID;
     settings.writeUuid   = NUS_RX_UUID;
     settings.notifyUuid  = NUS_TX_UUID;
   }
-  // Migrate: bleName default "Wyze Lock" -> "KP-01"
-  if(settings.bleName == "Wyze Lock") {
-    settings.bleName = "KP-01";
-  }
+  if(settings.bleName == "Wyze Lock") settings.bleName = "KP-01";
 }
 void saveSettings(){
   prefs.begin("wkpbridge",false);
@@ -268,6 +306,12 @@ void mqttPublish(const String &p){if(settings.mqttHost.isEmpty())return;addLog("
 void serviceMQTT(){}
 
 // --------------------------------------------------------------------------
+// Forward decls for sendPacket (used in notifyCB)
+// --------------------------------------------------------------------------
+bool sendPacket(const uint8_t *d,size_t l,const char *tag);
+bool isBleReady();
+
+// --------------------------------------------------------------------------
 // BLE callbacks
 // --------------------------------------------------------------------------
 class ClientCB : public NimBLEClientCallbacks {
@@ -288,6 +332,7 @@ public:
            +" (HCI=0x"+String(reason&0xFF,HEX)+")"
            +" peer="+String(c->getPeerAddress().toString().c_str()));
     writeChr=nullptr; notifyChr=nullptr;
+    gNonceReceived = false;
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
   void onAuthenticationComplete(NimBLEConnInfo &i) override {
@@ -302,10 +347,15 @@ public:
 };
 ClientCB gClientCB;
 
+// --------------------------------------------------------------------------
+// notifyCB -- auto AES-ECB auth response
+// --------------------------------------------------------------------------
 void notifyCB(NimBLERemoteCharacteristic *c,uint8_t *d,size_t l,bool n){
   String chrUuid = String(c->getUUID().toString().c_str());
   lastRxHex=bytesToHex(d,l);
   addLog("RX [" + chrUuid + "]: " + lastRxHex);
+
+  // Decode dd_protocol packets with magic header
   if(l >= 5 && d[0]==0xDE && d[1]==0xC0 && d[2]==0xAD && d[3]==0xDE) {
     uint8_t op = d[4];
     String opName;
@@ -314,12 +364,43 @@ void notifyCB(NimBLERemoteCharacteristic *c,uint8_t *d,size_t l,bool n){
       case 0x01: opName="BIND_RESP"; break;
       case 0x02: opName="KEYPRESS_RESP"; break;
       case 0xFE: opName="PROBE_RESP_FE"; break;
-      case 0xFF: opName="GET_RANDOM_RESP"; break;
-      default: opName="OP_0x"+String(op,HEX); break;
+      case 0xFF: opName="PROBE_RESP_FF"; break;
+      default:   opName="OP_0x"+String(op,HEX); break;
     }
     addLog("  -> dd_proto op=" + opName + " payload[" + String(l-5) + "]="
            + (l>5 ? bytesToHex(d+5, l-5) : "(none)"));
+    mqttPublish(lastRxHex);
+    return;
   }
+
+  // r9: Detect nonce packet (8 bytes, no magic header) -- GET_RANDOM challenge
+  // The keypad sends this immediately after we subscribe notify.
+  // We must AES-ECB encrypt it and send the first 8 bytes back as auth.
+  if(l == 8 && !(d[0]==0xDE && d[1]==0xC0)) {
+    addLog("  -> Detected 8-byte nonce (GET_RANDOM challenge): " + lastRxHex);
+    memcpy(gLastNonce, d, 8);
+    gNonceReceived = true;
+
+    uint8_t resp[8] = {0};
+    if(computeAuthResponse(gLastNonce, resp)) {
+      addLog("  -> AES-ECB auth response: " + bytesToHex(resp, 8));
+      // Small delay to let keypad settle after sending nonce
+      delay(20);
+      bool ok = sendPacket(resp, 8, "AUTH_RESP");
+      if(ok) {
+        addLog("  -> Auth response sent OK -- waiting for BIND/unlock acceptance");
+      } else {
+        addLog("  -> Auth response FAILED to send");
+      }
+    } else {
+      addLog("  -> AES computation failed!");
+    }
+    mqttPublish(lastRxHex);
+    return;
+  }
+
+  // Unknown/other packet
+  addLog("  -> Unknown packet (len=" + String(l) + ")");
   mqttPublish(lastRxHex);
 }
 
@@ -336,6 +417,7 @@ void deleteBleClient(){
     bleClient=nullptr;
   }
   writeChr=nullptr; notifyChr=nullptr;
+  gNonceReceived=false;
   addLog("DBG deleteBleClient done");
 }
 bool isBleReady(){return bleClient&&bleClient->isConnected()&&writeChr;}
@@ -509,8 +591,6 @@ bool tryConnect(const NimBLEAddress &addr,const char *label){
   addLog(String("DBG tryConnect [") + label + "] creating client");
   bleClient=NimBLEDevice::createClient();
   bleClient->setClientCallbacks(&gClientCB,false);
-  // r8: Do NOT set our own conn params -- keypad prefers 7.5-10ms (itvl 6-8).
-  //     Let the keypad negotiate after connection; forcing 12/12 caused instability.
   bleClient->setConnectTimeout(500);  // 500 * 10ms = 5 seconds
   addLog(String(label)+": connecting to "+String(addr.toString().c_str())
          +" type="+String(addr.getType()));
@@ -603,14 +683,12 @@ bool connectBle(){
   addLog("DBG connectBle: exchanging MTU");
   bleClient->exchangeMTU();
   addLog("MTU="+String(bleClient->getMTU()));
-  // r8: NO updateConnParams -- keypad negotiates its own (7.5-10ms preferred)
   dumpAllGatt();
 
   addLog("Locating service: "+settings.serviceUuid);
   NimBLERemoteService *svc=bleClient->getService(NimBLEUUID(settings.serviceUuid.c_str()));
   if(!svc){
     addLog("Service not found: "+settings.serviceUuid);
-    // Fallback: try NUS by full UUID in case settings drift
     if(settings.serviceUuid != NUS_SERVICE_UUID) {
       addLog("Trying NUS fallback...");
       svc=bleClient->getService(NimBLEUUID(NUS_SERVICE_UUID));
@@ -623,7 +701,6 @@ bool connectBle(){
   }
   addLog("Service found: "+String(svc->getUUID().toString().c_str()));
 
-  // Write char = NUS RX (6e400002) -- this is where we TX to the keypad
   writeChr=svc->getCharacteristic(NimBLEUUID(settings.writeUuid.c_str()));
   if(!writeChr && settings.writeUuid != NUS_RX_UUID)
     writeChr=svc->getCharacteristic(NimBLEUUID(NUS_RX_UUID));
@@ -634,7 +711,6 @@ bool connectBle(){
   addLog("Write chr: "+String(writeChr->getUUID().toString().c_str())
          +" canWrite="+String((writeChr->canWrite()||writeChr->canWriteNoResponse())?"yes":"no"));
 
-  // Notify char = NUS TX (6e400003) -- keypad sends data here
   if(settings.notifyUuid.length()){
     notifyChr=svc->getCharacteristic(NimBLEUUID(settings.notifyUuid.c_str()));
     if(!notifyChr && settings.notifyUuid != NUS_TX_UUID)
@@ -643,15 +719,10 @@ bool connectBle(){
       addLog("DBG connectBle: subscribing notify");
       if(notifyChr->subscribe(true,notifyCB)) {
         addLog("Notify subscribed: "+String(notifyChr->getUUID().toString().c_str()));
-        // r8: Auto-probe -- send PKT_FF immediately after subscribe to trigger
-        //     the keypad's GET_RANDOM challenge. Without this the keypad hangs
-        //     waiting for the post-connect handshake and disconnects (HCI 0x13)
-        //     after ~8 seconds.
-        addLog("r8: Auto-probe: sending PKT_FF to trigger GET_RANDOM handshake...");
-        delay(50);  // brief settle after subscribe before first write
-        bool probeOk = writeChr->writeValue(PKT_FF, sizeof(PKT_FF), settings.writeWithResponse);
-        lastTxHex = bytesToHex(PKT_FF, sizeof(PKT_FF));
-        addLog("r8: Auto-probe TX: "+lastTxHex+" -> "+(probeOk?"OK":"FAIL"));
+        // r9: Do NOT send anything here -- keypad initiates the handshake.
+        //     It will send an 8-byte nonce (GET_RANDOM challenge) to us via notify.
+        //     notifyCB will detect it and auto-respond with AES-ECB(nonce, key).
+        addLog("r9: Waiting for keypad GET_RANDOM nonce challenge (do not send anything)...");
       } else {
         addLog("Notify subscribe failed");
       }
@@ -660,7 +731,7 @@ bool connectBle(){
     }
   }
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
-  addLog("BLE ready");
+  addLog("BLE ready -- awaiting keypad nonce");
   return true;
 }
 
@@ -677,6 +748,16 @@ bool sendRawHex(const String &hex){
   std::vector<uint8_t> buf;
   if(!parseHexString(hex,buf)){addLog("Hex parse failed: '"+hex+"'");return false;}
   return sendPacket(buf.data(),buf.size(),"RAW");
+}
+
+// --------------------------------------------------------------------------
+// Manual auth response (re-sends AES response using last stored nonce)
+// --------------------------------------------------------------------------
+bool sendAuthResp(){
+  if(!gNonceReceived){addLog("No nonce received yet");return false;}
+  uint8_t resp[8]={0};
+  if(!computeAuthResponse(gLastNonce,resp)){addLog("AES failed");return false;}
+  return sendPacket(resp,8,"AUTH_RESP_MANUAL");
 }
 
 String makeStateJson(){
@@ -705,6 +786,8 @@ String makeStateJson(){
   json+="\"scanSeconds\":"+String(settings.scanSeconds)+",";
   json+="\"mqttHost\":\""+jsonEscape(settings.mqttHost)+"\",\"mqttPort\":"+String(settings.mqttPort)+",";
   json+="\"mqttUser\":\""+jsonEscape(settings.mqttUser)+"\",\"mqttTopic\":\""+jsonEscape(settings.mqttTopic)+"\",";
+  json+="\"nonceReceived\":"+String(gNonceReceived?"true":"false")+",";
+  json+="\"lastNonce\":\""+String(gNonceReceived?bytesToHex(gLastNonce,8):"")+"\",";
   json+="\"lastTx\":\""+jsonEscape(lastTxHex)+"\",\"lastRx\":\""+jsonEscape(lastRxHex)+"\",";
   json+="\"logs\":\""+jsonEscape(logBuffer)+"\",\"scan\":"+lastScanJson;
   json+="}";return json;
@@ -746,6 +829,8 @@ void handleSendRaw()   {sendRawHex(server.arg("hex"))?sendOk("Raw sent"):sendErr
 void handleClearLog()  {logBuffer="";lastTxHex="";lastRxHex="";sendOk("Log cleared");}
 void handleReboot()    {sendOk("Rebooting");delay(200);ESP.restart();}
 void handleGattDump()  {dumpAllGatt();sendOk("GATT dump in log");}
+void handleSendAuthResp() {sendAuthResp()?sendOk("Auth resp sent"):sendErr("Auth resp failed - check log");}
+void handleSendGetRandom(){sendPacket(PKT_FF,sizeof(PKT_FF),"GET_RANDOM_MANUAL")?sendOk("GET_RANDOM sent"):sendErr("failed");}
 
 void setupWeb(){
   server.on("/",HTTP_GET,handleRoot);server.on("/api/state",HTTP_GET,handleState);
@@ -758,6 +843,8 @@ void setupWeb(){
   server.on("/api/sendRaw",HTTP_POST,handleSendRaw);      server.on("/api/clearLog",HTTP_POST,handleClearLog);
   server.on("/api/clearBonds",HTTP_POST,handleClearBonds);server.on("/api/reboot",HTTP_POST,handleReboot);
   server.on("/api/gattDump",HTTP_POST,handleGattDump);
+  server.on("/api/sendAuthResp",HTTP_POST,handleSendAuthResp);
+  server.on("/api/sendGetRandom",HTTP_POST,handleSendGetRandom);
   server.onNotFound([](){if(portalMode){server.sendHeader("Location","/",true);server.send(302,"text/plain","");}else server.send(404,"text/plain","Not found");});
   server.begin();addLog("HTTP server started");
 }
@@ -776,12 +863,14 @@ void serviceBleAutoConnect(){
 }
 
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r8");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r9");
   loadSettings();
   addLog("addr="+settings.bleAddress+" storedType="+settings.bleAddrType);
   addLog("svc="+settings.serviceUuid);
   addLog("wr="+settings.writeUuid);
   addLog("nt="+settings.notifyUuid);
+  // Log AES key for verification
+  addLog("AES key: "+bytesToHex(AES_KEY,16));
   WiFi.disconnect(true,true);delay(200);
   beginWiFi(false);
   NimBLEDevice::init("");
@@ -806,7 +895,8 @@ void loop(){
   serviceWiFi();serviceMQTT();serviceBleAutoConnect();
   if(millis()-lastStateMs>10000){
     lastStateMs=millis();
-    addLog("State wifi="+String(WiFi.status()==WL_CONNECTED?"up":"down")+" ble="+String(isBleReady()?"up":"down"));
+    addLog("State wifi="+String(WiFi.status()==WL_CONNECTED?"up":"down")+" ble="+String(isBleReady()?"up":"down")
+           +" nonce="+String(gNonceReceived?"yes":"waiting"));
   }
   delay(5);
 }
