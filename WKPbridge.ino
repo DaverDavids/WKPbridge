@@ -256,7 +256,7 @@ public:
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
     addLog("BLE auth complete: encrypted="+String(connInfo.isEncrypted())
            +" bonded="+String(connInfo.isBonded())
-           +" secLevel="+String(connInfo.getSecurityMode()));
+           +" authenticated="+String(connInfo.isAuthenticated()));
   }
 };
 SecurityCB gClientCB;
@@ -328,8 +328,6 @@ String scanJson() {
 
 // --------------------------------------------------------------------------
 // BLE connect
-// Wyze Lock uses Legacy pairing, Just Works, bonding only.
-// Sequence: connect (no MTU) -> secureConnection -> MTU -> discover
 // --------------------------------------------------------------------------
 bool connectBle() {
   deleteBleClient();
@@ -362,10 +360,8 @@ bool connectBle() {
   addLog("Link up — pairing (Just Works legacy)...");
 
   if(!bleClient->secureConnection()) {
-    addLog("secureConnection() failed lastErr=0x"+String(bleClient->getLastError(), HEX));
-    // 0x505 = lock rejected our security params.
-    // Try continuing without encryption - some Wyze FW versions don't require it.
-    addLog("Attempting GATT without encryption...");
+    addLog("secureConnection() failed lastErr=0x"+String(bleClient->getLastError(), HEX)
+           +" — continuing unencrypted");
   }
 
   bleClient->exchangeMTU();
@@ -563,9 +559,8 @@ void setup(){
   NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
   addLog("Own addr: "+String(NimBLEDevice::getAddress().toString().c_str()));
 
-  // Wyze Lock: Legacy pairing, Just Works, bonding only.
-  // NO MITM, NO Secure Connections — those cause 0x505 rejection.
-  NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND);  // bond only
+  // Wyze Lock: Legacy Just Works, bond only, no MITM, no SC
+  NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
