@@ -4,8 +4,10 @@
 // Fix log:
 //  2026-03-24 r1: Security=NO-BOND, remove secureConnection(), coex before connect,
 //                 NUS UUIDs as defaults, Wyze mfr-data scan fallback
-//  2026-03-24 r2: Fix 0x0D - always use addrType from live scan result, not stored setting
-//                 (UI stored 'public' but device advertises as random type=1)
+//  2026-03-24 r2: Fix 0x0D addrType - always use type from live scan result
+//  2026-03-24 r3: Fix 0x0D BLE_HS_EAPP - stop scan before connect()
+//                 ESP32 NimBLE shares scan/connect controller state machine;
+//                 connect() called while scan holds the controller = immediate reject
 
 #define DEBUG_SERIAL 1
 
@@ -85,6 +87,10 @@ String lastScanJson = "[]";
 String lastTxHex;
 String lastRxHex;
 String currentTargetAddr;
+
+// Persistent copy of found device address/type for connect after scan stops
+static NimBLEAddress gFoundAddress;
+static bool          gFoundValid = false;
 
 NimBLEClient               *bleClient = nullptr;
 NimBLERemoteCharacteristic *writeChr  = nullptr;
@@ -244,7 +250,6 @@ void serviceMQTT() { }
 
 // --------------------------------------------------------------------------
 // BLE client callbacks
-// NOTE: No security/bonding callbacks needed - WLCKKP1 connects unencrypted
 // --------------------------------------------------------------------------
 class ClientCB : public NimBLEClientCallbacks {
 public:
@@ -279,7 +284,7 @@ void deleteBleClient() {
 bool isBleReady() { return bleClient && bleClient->isConnected() && writeChr; }
 
 // --------------------------------------------------------------------------
-// Manufacturer data match helper - check for Wyze Company ID 0x4459
+// Manufacturer data match helper
 // --------------------------------------------------------------------------
 bool isWyzeDevice(const NimBLEAdvertisedDevice *dev) {
   if (!dev->haveManufacturerData()) return false;
@@ -291,10 +296,15 @@ bool isWyzeDevice(const NimBLEAdvertisedDevice *dev) {
 
 // --------------------------------------------------------------------------
 // BLE scan
+// FIX r3: Save found device address+type BEFORE stopping scan.
+//         scan->stop() + scan->clearResults() MUST be called before connect().
+//         The ESP32 BLE controller cannot scan and connect simultaneously;
+//         connect() while scan is still held returns BLE_HS_EAPP (0x0D) immediately.
 // --------------------------------------------------------------------------
-const NimBLEAdvertisedDevice* doScanFindTarget(uint8_t secs, const String &targetUpper) {
-  if(scanRunning){ addLog("Scan busy"); return nullptr; }
+bool doScanFindTarget(uint8_t secs, const String &targetUpper) {
+  if(scanRunning){ addLog("Scan busy"); return false; }
   scanRunning=true;
+  gFoundValid=false;
 
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
   addLog("Coex -> BLE priority");
@@ -310,9 +320,10 @@ const NimBLEAdvertisedDevice* doScanFindTarget(uint8_t secs, const String &targe
   NimBLEScanResults results = scan->getResults(durationMs, false);
   addLog("Scan done: "+String(results.getCount())+" device(s)");
 
-  const NimBLEAdvertisedDevice *found = nullptr;
   String json="["; bool first=true;
   currentTargetAddr="";
+  NimBLEAddress foundAddr;
+  bool found=false;
 
   for(int i=0;i<results.getCount();i++){
     const NimBLEAdvertisedDevice *dev = results.getDevice(i);
@@ -327,18 +338,26 @@ const NimBLEAdvertisedDevice* doScanFindTarget(uint8_t secs, const String &targe
     if(!first) json+=","; first=false;
     json+="{\"addr\":\""+jsonEscape(addr)+"\",\"addrType\":\""+ats+"\",\"name\":\""+jsonEscape(name)+"\",\"rssi\":"+String(rssi)+",\"wyze\":"+String(wyze?"true":"false")+"}";
 
-    // Priority 1: exact address match
-    if(!found&&!targetUpper.isEmpty()&&addrUp==targetUpper){ found=dev; addLog("  -> addr match"); }
-    // Priority 2: name match
+    if(!found&&!targetUpper.isEmpty()&&addrUp==targetUpper){ foundAddr=dev->getAddress(); found=true; addLog("  -> addr match"); }
     if(!found&&settings.bleName.length()&&name.length()){
       String n1=name; n1.toLowerCase(); String n2=settings.bleName; n2.toLowerCase();
-      if(n1.indexOf(n2)>=0){ found=dev; addLog("  -> name match '"+name+"'"); currentTargetAddr=addr; }
+      if(n1.indexOf(n2)>=0){ foundAddr=dev->getAddress(); found=true; addLog("  -> name match '"+name+"'"); currentTargetAddr=addr; }
     }
-    // Priority 3: Wyze manufacturer data fallback (Company ID 0x4459)
-    if(!found&&wyze){ found=dev; addLog("  -> Wyze mfr-data match"); currentTargetAddr=addr; }
+    if(!found&&wyze){ foundAddr=dev->getAddress(); found=true; addLog("  -> Wyze mfr-data match"); currentTargetAddr=addr; }
   }
   json+="]"; lastScanJson=json;
+
+  // FIX r3: CRITICAL - stop and clear scan BEFORE returning, so connect() can use the controller
+  scan->stop();
+  scan->clearResults();
+  addLog("Scan stopped+cleared");
+
   scanRunning=false;
+
+  if(found) {
+    gFoundAddress = foundAddr;
+    gFoundValid   = true;
+  }
   return found;
 }
 
@@ -352,15 +371,6 @@ String scanJson() {
 
 // --------------------------------------------------------------------------
 // BLE connect
-//
-// ROOT CAUSE OF 0x0D ERROR:
-//   settings.bleAddrType was saved as "public" from the UI while the device
-//   actually advertises as BLE_ADDR_RANDOM (type=1). The NimBLE HCI layer
-//   rejects the connection attempt when addr type is wrong (error 0x0d).
-//
-// FIX: Use address type directly from the live NimBLEAdvertisedDevice scan
-//   result. Also auto-correct settings.bleAddrType so the UI stays accurate.
-//   The stored bleAddrType is now only used for UI display, never for connect.
 // --------------------------------------------------------------------------
 bool connectBle() {
   deleteBleClient();
@@ -372,28 +382,29 @@ bool connectBle() {
     addLog("Connect skipped: no target"); return false;
   }
 
-  const NimBLEAdvertisedDevice *found=doScanFindTarget(settings.scanSeconds,target);
-  if(!found){
+  bool found = doScanFindTarget(settings.scanSeconds, target);
+  if(!found || !gFoundValid){
     addLog("Target not found in scan");
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
 
-  // FIX: Read address type from the scan result directly (NOT from settings)
-  uint8_t scannedAddrType = found->getAddress().getType();
+  // Use the address saved from scan results (scan is now fully stopped)
+  NimBLEAddress peerAddr = gFoundAddress;
+  uint8_t scannedAddrType = peerAddr.getType();
   String scannedAddrTypeStr = (scannedAddrType == BLE_ADDR_RANDOM) ? "random" : "public";
 
-  // Auto-correct stored setting if it disagrees with scan reality
   if(settings.bleAddrType != scannedAddrTypeStr) {
-    addLog("addrType mismatch: stored='" + settings.bleAddrType +
-           "' scan='" + scannedAddrTypeStr + "' -> correcting");
+    addLog("addrType corrected: '"+settings.bleAddrType+"' -> '"+scannedAddrTypeStr+"'");
     settings.bleAddrType = scannedAddrTypeStr;
     saveSettings();
   }
 
-  addLog("Connecting to " + String(found->getAddress().toString().c_str())
-         + " addrType=" + String(scannedAddrType) + " (" + scannedAddrTypeStr + ")");
+  addLog("Connecting to "+String(peerAddr.toString().c_str())
+         +" addrType="+String(scannedAddrType)+" ("+scannedAddrTypeStr+")");
 
-  // Boost BLE coex priority for the connect window
+  // FIX r3: Brief yield after scan stop so controller state fully releases
+  delay(50);
+
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
 
   bleClient = NimBLEDevice::createClient();
@@ -401,12 +412,11 @@ bool connectBle() {
   bleClient->setConnectionParams(24, 40, 0, 400);
   bleClient->setConnectTimeout(10);
 
-  // connect() using the found device object - NimBLE uses the device's own addrType internally
-  if(!bleClient->connect(found, false, false, false)) {
+  if(!bleClient->connect(peerAddr, false)) {
     addLog("connect() failed lastErr=0x"+String(bleClient->getLastError(), HEX));
     deleteBleClient(); esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
-  addLog("Link up — no pairing required (device connects unencrypted)");
+  addLog("Link up");
 
   bleClient->exchangeMTU();
   addLog("MTU="+String(bleClient->getMTU()));
@@ -604,7 +614,6 @@ void setup(){
   NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
   addLog("Own addr: "+String(NimBLEDevice::getAddress().toString().c_str()));
 
-  // WLCKKP1 does NOT bond or encrypt - connect as no-security
   NimBLEDevice::setSecurityAuth(0);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
