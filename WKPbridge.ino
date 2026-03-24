@@ -23,6 +23,19 @@
 //       at controller level. Calling deleteBleClient() in that case sends a disconnect
 //       to the keypad (0x216 = local host terminated), causing error beep + exit pairing.
 //       Added extensive debug logging throughout connect/callback path.
+//  r8:  Decompile analysis conclusions:
+//       - Transport is NUS (6e400001/02/03), NOT 0xFE50/FE51/FE52.
+//         FE50 services are absent from the GATT dump; NUS is the real channel.
+//       - Default UUIDs switched to NUS. Stored settings migrated on boot.
+//       - Removed updateConnParams() call: keypad advertises preferred itvl=6-8
+//         (7.5-10ms); our 12/12 params were out of range and causing instability.
+//         The keypad negotiates its own params after connection -- let it.
+//       - Auto-probe on connect: immediately after subscribing notify, send PKT_FF
+//         (DE C0 AD DE FF 01 1E F1) to kick off the GET_RANDOM handshake.
+//         Without this the keypad disconnects with HCI 0x13 after ~8s timeout
+//         because the expected post-connect challenge never arrives.
+//       - All RX is logged verbatim so we can decode the GET_RANDOM response
+//         format on the next capture.
 
 #define DEBUG_SERIAL 1
 
@@ -44,15 +57,17 @@ static const char *HOSTNAME = "WKPbridge";
 static const char *AP_SSID  = "WKPbridge-setup";
 static const byte DNS_PORT  = 53;
 
-// ---- Wyze UUIDs (from firmware decompile) --------------------------------
+// ---- Transport UUIDs (Nordic UART Service - confirmed via GATT dump) -----
+// r8: Keypad uses NUS as its transport layer (dd_protocol frames over NUS).
+//     0xFE50 service is NOT present; NUS is the only viable channel.
+static const char *NUS_SERVICE_UUID   = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+static const char *NUS_RX_UUID        = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";  // we write here
+static const char *NUS_TX_UUID        = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";  // keypad notifies here
+
+// Legacy / alternate names kept for reference
 static const char *WYZE_SERVICE_UUID  = "0000fe50-0000-1000-8000-00805f9b34fb";
 static const char *WYZE_WRITE_UUID    = "0000fe51-0000-1000-8000-00805f9b34fb";
 static const char *WYZE_NOTIFY_UUID   = "0000fe52-0000-1000-8000-00805f9b34fb";
-
-// Legacy NUS UUIDs (kept as fallback if user overrides)
-static const char *NUS_SERVICE_UUID   = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-static const char *NUS_RX_UUID        = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
-static const char *NUS_TX_UUID        = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 static const uint16_t WYZE_COMPANY_ID = 0x4459;  // 'DY' little-endian
 
@@ -133,7 +148,10 @@ NimBLEClient               *bleClient = nullptr;
 NimBLERemoteCharacteristic *writeChr  = nullptr;
 NimBLERemoteCharacteristic *notifyChr = nullptr;
 
-// ---- Packet presets ------------------------------------------------------
+// ---- Packet presets (dd_protocol framing over NUS) -----------------------
+// Magic: DE C0 AD DE  ("DEAD C0DE" reversed)
+// r8: PKT_FF is the initial probe / GET_RANDOM trigger sent right after
+//     subscribing notify. Without it the keypad times out (HCI 0x13 ~8s).
 static const uint8_t PKT_FF[8]    = {0xDE,0xC0,0xAD,0xDE,0xFF,0x01,0x1E,0xF1};
 static const uint8_t PKT_FE[8]    = {0xDE,0xC0,0xAD,0xDE,0xFE,0x01,0x1E,0xF1};
 static const uint8_t PKT_BIND[8]  = {0xDE,0xC0,0xAD,0xDE,0x01,0x1E,0xF1,0x00};
@@ -189,10 +207,11 @@ void loadSettings(){
   settings.wifiPsk     =prefs.getString("wifi_psk", MYPSK);
   settings.bleAddress  =prefs.getString("ble_addr", "");
   settings.bleAddrType =prefs.getString("ble_atype","random");
-  settings.bleName     =prefs.getString("ble_name", "Wyze Lock");
-  settings.serviceUuid =prefs.getString("svc_uuid", WYZE_SERVICE_UUID);
-  settings.writeUuid   =prefs.getString("wr_uuid",  WYZE_WRITE_UUID);
-  settings.notifyUuid  =prefs.getString("nt_uuid",  WYZE_NOTIFY_UUID);
+  settings.bleName     =prefs.getString("ble_name", "KP-01");
+  // r8: Migrate stored UUID to NUS if it was the old Wyze FE50 default
+  settings.serviceUuid =prefs.getString("svc_uuid", NUS_SERVICE_UUID);
+  settings.writeUuid   =prefs.getString("wr_uuid",  NUS_RX_UUID);
+  settings.notifyUuid  =prefs.getString("nt_uuid",  NUS_TX_UUID);
   settings.autoConnect      =prefs.getBool  ("auto_conn",false);
   settings.writeWithResponse=prefs.getBool  ("wr_rsp",   false);
   settings.scanSeconds      =prefs.getUChar ("scan_sec", 5);
@@ -200,6 +219,17 @@ void loadSettings(){
   settings.mqttUser=prefs.getString("mqtt_user","");settings.mqttPass=prefs.getString("mqtt_pass","");
   settings.mqttTopic=prefs.getString("mqtt_topic","wkpbridge");
   prefs.end();
+  // Migrate: if stored UUIDs are still the old FE50 values, reset to NUS
+  if(settings.serviceUuid == WYZE_SERVICE_UUID) {
+    addLog("r8 migrate: resetting UUIDs from FE50 -> NUS");
+    settings.serviceUuid = NUS_SERVICE_UUID;
+    settings.writeUuid   = NUS_RX_UUID;
+    settings.notifyUuid  = NUS_TX_UUID;
+  }
+  // Migrate: bleName default "Wyze Lock" -> "KP-01"
+  if(settings.bleName == "Wyze Lock") {
+    settings.bleName = "KP-01";
+  }
 }
 void saveSettings(){
   prefs.begin("wkpbridge",false);
@@ -284,10 +314,10 @@ void notifyCB(NimBLERemoteCharacteristic *c,uint8_t *d,size_t l,bool n){
       case 0x01: opName="BIND_RESP"; break;
       case 0x02: opName="KEYPRESS_RESP"; break;
       case 0xFE: opName="PROBE_RESP_FE"; break;
-      case 0xFF: opName="PROBE_RESP_FF"; break;
+      case 0xFF: opName="GET_RANDOM_RESP"; break;
       default: opName="OP_0x"+String(op,HEX); break;
     }
-    addLog("  -> Wyze pkt op=" + opName + " payload[" + String(l-5) + "]="
+    addLog("  -> dd_proto op=" + opName + " payload[" + String(l-5) + "]="
            + (l>5 ? bytesToHex(d+5, l-5) : "(none)"));
   }
   mqttPublish(lastRxHex);
@@ -475,19 +505,13 @@ String scanJson(){
 // --------------------------------------------------------------------------
 // BLE connect
 // --------------------------------------------------------------------------
-// r7d: Returns true if connected (ok==true OR connect() returned false but
-//      isConnected() is true -- EALREADY can occur when connection succeeded
-//      at the HCI/controller level but the NimBLE host state machine had a
-//      conflict. Treating EALREADY as failure was causing deleteBleClient()
-//      to send a disconnect to the keypad (reason 0x216 = local host terminated)
-//      which made the keypad error-beep and exit pairing mode.
 bool tryConnect(const NimBLEAddress &addr,const char *label){
   addLog(String("DBG tryConnect [") + label + "] creating client");
   bleClient=NimBLEDevice::createClient();
   bleClient->setClientCallbacks(&gClientCB,false);
-  bleClient->setConnectionParams(24,40,0,400);
-  // NimBLE 2.x: setConnectTimeout unit = 10ms. 500 = 5 seconds.
-  bleClient->setConnectTimeout(500);
+  // r8: Do NOT set our own conn params -- keypad prefers 7.5-10ms (itvl 6-8).
+  //     Let the keypad negotiate after connection; forcing 12/12 caused instability.
+  bleClient->setConnectTimeout(500);  // 500 * 10ms = 5 seconds
   addLog(String(label)+": connecting to "+String(addr.toString().c_str())
          +" type="+String(addr.getType()));
 
@@ -502,13 +526,10 @@ bool tryConnect(const NimBLEAddress &addr,const char *label){
          +" isConnected="+String(actuallyConnected)
          +" elapsed="+String(elapsed)+"ms");
 
-  // If connect() returned false but we ARE actually connected, treat as success.
-  // This handles EALREADY race where HCI connected but NimBLE host flagged conflict.
   if(!ok && actuallyConnected) {
     addLog(String(label)+": connect() false but isConnected=true -> treating as SUCCESS");
     return true;
   }
-  // If connect() returned true but somehow not connected, log it
   if(ok && !actuallyConnected) {
     addLog(String(label)+": WARNING connect() true but isConnected=false");
   }
@@ -554,7 +575,6 @@ bool connectBle(){
 
   if(!ok){
     addLog("DBG connectBle: Attempt1 failed, isConn="+String(bleClient?bleClient->isConnected():false));
-    // Only delete/retry if we're truly not connected
     if(bleClient && bleClient->isConnected()) {
       addLog("DBG connectBle: client IS connected despite fail return -- proceeding");
       ok = true;
@@ -583,27 +603,30 @@ bool connectBle(){
   addLog("DBG connectBle: exchanging MTU");
   bleClient->exchangeMTU();
   addLog("MTU="+String(bleClient->getMTU()));
-  addLog("DBG connectBle: updating conn params");
-  bleClient->updateConnParams(12,12,0,200);
+  // r8: NO updateConnParams -- keypad negotiates its own (7.5-10ms preferred)
   dumpAllGatt();
 
   addLog("Locating service: "+settings.serviceUuid);
   NimBLERemoteService *svc=bleClient->getService(NimBLEUUID(settings.serviceUuid.c_str()));
   if(!svc){
     addLog("Service not found: "+settings.serviceUuid);
-    if(settings.serviceUuid==WYZE_SERVICE_UUID){
-      addLog("Trying short UUID 0xFE50...");
-      svc=bleClient->getService(NimBLEUUID((uint16_t)0xFE50));
+    // Fallback: try NUS by full UUID in case settings drift
+    if(settings.serviceUuid != NUS_SERVICE_UUID) {
+      addLog("Trying NUS fallback...");
+      svc=bleClient->getService(NimBLEUUID(NUS_SERVICE_UUID));
     }
     if(!svc){
       addLog("Service still not found.");
       deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;
     }
+    addLog("NUS fallback found");
   }
   addLog("Service found: "+String(svc->getUUID().toString().c_str()));
 
+  // Write char = NUS RX (6e400002) -- this is where we TX to the keypad
   writeChr=svc->getCharacteristic(NimBLEUUID(settings.writeUuid.c_str()));
-  if(!writeChr) writeChr=svc->getCharacteristic(NimBLEUUID((uint16_t)0xFE51));
+  if(!writeChr && settings.writeUuid != NUS_RX_UUID)
+    writeChr=svc->getCharacteristic(NimBLEUUID(NUS_RX_UUID));
   if(!writeChr){
     addLog("Write chr not found");
     deleteBleClient();esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);return false;
@@ -611,15 +634,30 @@ bool connectBle(){
   addLog("Write chr: "+String(writeChr->getUUID().toString().c_str())
          +" canWrite="+String((writeChr->canWrite()||writeChr->canWriteNoResponse())?"yes":"no"));
 
+  // Notify char = NUS TX (6e400003) -- keypad sends data here
   if(settings.notifyUuid.length()){
     notifyChr=svc->getCharacteristic(NimBLEUUID(settings.notifyUuid.c_str()));
-    if(!notifyChr) notifyChr=svc->getCharacteristic(NimBLEUUID((uint16_t)0xFE52));
+    if(!notifyChr && settings.notifyUuid != NUS_TX_UUID)
+      notifyChr=svc->getCharacteristic(NimBLEUUID(NUS_TX_UUID));
     if(notifyChr&&(notifyChr->canNotify()||notifyChr->canIndicate())){
       addLog("DBG connectBle: subscribing notify");
-      if(notifyChr->subscribe(true,notifyCB))
+      if(notifyChr->subscribe(true,notifyCB)) {
         addLog("Notify subscribed: "+String(notifyChr->getUUID().toString().c_str()));
-      else addLog("Notify subscribe failed");
-    } else addLog("Notify chr not subscribable");
+        // r8: Auto-probe -- send PKT_FF immediately after subscribe to trigger
+        //     the keypad's GET_RANDOM challenge. Without this the keypad hangs
+        //     waiting for the post-connect handshake and disconnects (HCI 0x13)
+        //     after ~8 seconds.
+        addLog("r8: Auto-probe: sending PKT_FF to trigger GET_RANDOM handshake...");
+        delay(50);  // brief settle after subscribe before first write
+        bool probeOk = writeChr->writeValue(PKT_FF, sizeof(PKT_FF), settings.writeWithResponse);
+        lastTxHex = bytesToHex(PKT_FF, sizeof(PKT_FF));
+        addLog("r8: Auto-probe TX: "+lastTxHex+" -> "+(probeOk?"OK":"FAIL"));
+      } else {
+        addLog("Notify subscribe failed");
+      }
+    } else {
+      addLog("Notify chr not subscribable");
+    }
   }
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   addLog("BLE ready");
@@ -738,7 +776,7 @@ void serviceBleAutoConnect(){
 }
 
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r7d");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r8");
   loadSettings();
   addLog("addr="+settings.bleAddress+" storedType="+settings.bleAddrType);
   addLog("svc="+settings.serviceUuid);
