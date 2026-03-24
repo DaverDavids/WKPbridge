@@ -1,5 +1,13 @@
 // WKPbridge.ino
-// ESP32-C3 BLE-to-WiFi bridge
+// ESP32-C3 BLE-to-WiFi bridge for Wyze Wireless Keypad (WLCKKP1)
+//
+// Fixes applied 2026-03-24:
+//  1. Security set to NO-BOND / NO-PAIRING  (nRF Connect shows "NOT BONDED" on successful connect)
+//  2. secureConnection() call removed        (device does not encrypt)
+//  3. BLE coex priority raised BEFORE connect() not just during scan
+//  4. Default UUIDs pre-set to Nordic UART Service (confirmed by nRF Connect screenshot)
+//  5. Manufacturer-data fallback scan match on Wyze Company ID 0x4459
+//  6. connect() args corrected: deleteAttrs=false so attr cache is preserved
 
 #define DEBUG_SERIAL 1
 
@@ -20,6 +28,14 @@
 static const char *HOSTNAME = "WKPbridge";
 static const char *AP_SSID  = "WKPbridge-setup";
 static const byte DNS_PORT  = 53;
+
+// Nordic UART Service UUIDs (confirmed via nRF Connect on WLCKKP1)
+static const char *NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+static const char *NUS_RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write (phone->device)
+static const char *NUS_TX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify (device->phone)
+
+// Wyze manufacturer company ID seen in advertisement
+static const uint16_t WYZE_COMPANY_ID = 0x4459;
 
 #if DEBUG_SERIAL
   #define DBG_BEGIN(x)    Serial.begin(x)
@@ -145,10 +161,10 @@ void loadSettings() {
   settings.wifiPsk           = prefs.getString("wifi_psk",   MYPSK);
   settings.bleAddress        = prefs.getString("ble_addr",   "");
   settings.bleAddrType       = prefs.getString("ble_atype",  "random");
-  settings.bleName           = prefs.getString("ble_name",   "");
-  settings.serviceUuid       = prefs.getString("svc_uuid",   "");
-  settings.writeUuid         = prefs.getString("wr_uuid",    "");
-  settings.notifyUuid        = prefs.getString("nt_uuid",    "");
+  settings.bleName           = prefs.getString("ble_name",   "Wyze Lock");
+  settings.serviceUuid       = prefs.getString("svc_uuid",   NUS_SERVICE_UUID);
+  settings.writeUuid         = prefs.getString("wr_uuid",    NUS_RX_UUID);
+  settings.notifyUuid        = prefs.getString("nt_uuid",    NUS_TX_UUID);
   settings.autoConnect       = prefs.getBool  ("auto_conn",  false);
   settings.writeWithResponse = prefs.getBool  ("wr_rsp",     false);
   settings.scanSeconds       = prefs.getUChar ("scan_sec",   5);
@@ -229,9 +245,10 @@ void mqttPublish(const String &payload) {
 void serviceMQTT() { }
 
 // --------------------------------------------------------------------------
-// BLE client + security callbacks
+// BLE client callbacks
+// NOTE: No security/bonding callbacks needed - WLCKKP1 connects unencrypted
 // --------------------------------------------------------------------------
-class SecurityCB : public NimBLEClientCallbacks {
+class ClientCB : public NimBLEClientCallbacks {
 public:
   void onConnect(NimBLEClient *c) override {
     addLog("BLE onConnect: "+String(c->getPeerAddress().toString().c_str()));
@@ -245,21 +262,14 @@ public:
     addLog("BLE onDisconnect: reason=0x"+String(reason, HEX));
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   }
-  void onPassKeyEntry(NimBLEConnInfo &connInfo) override {
-    addLog("BLE pairing: passkey entry, injecting 000000");
-    NimBLEDevice::injectPassKey(connInfo, 000000);
-  }
-  void onConfirmPasskey(NimBLEConnInfo &connInfo, uint32_t pin) override {
-    addLog("BLE pairing: confirm pin="+String(pin)+" -> YES");
-    NimBLEDevice::injectConfirmPasskey(connInfo, true);
-  }
+  // Auth callbacks kept for logging only - we do not initiate pairing
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
     addLog("BLE auth complete: encrypted="+String(connInfo.isEncrypted())
            +" bonded="+String(connInfo.isBonded())
            +" authenticated="+String(connInfo.isAuthenticated()));
   }
 };
-SecurityCB gClientCB;
+ClientCB gClientCB;
 
 void notifyCB(NimBLERemoteCharacteristic *pChr, uint8_t *data, size_t len, bool isNotify) {
   (void)pChr; (void)isNotify;
@@ -270,6 +280,17 @@ void deleteBleClient() {
   writeChr=nullptr; notifyChr=nullptr;
 }
 bool isBleReady() { return bleClient && bleClient->isConnected() && writeChr; }
+
+// --------------------------------------------------------------------------
+// Manufacturer data match helper - check for Wyze Company ID 0x4459
+// --------------------------------------------------------------------------
+bool isWyzeDevice(const NimBLEAdvertisedDevice *dev) {
+  if (!dev->haveManufacturerData()) return false;
+  const std::string &mfr = dev->getManufacturerData();
+  if (mfr.size() < 2) return false;
+  uint16_t companyId = (uint8_t)mfr[0] | ((uint8_t)mfr[1] << 8);
+  return companyId == WYZE_COMPANY_ID;
+}
 
 // --------------------------------------------------------------------------
 // BLE scan
@@ -304,14 +325,20 @@ const NimBLEAdvertisedDevice* doScanFindTarget(uint8_t secs, const String &targe
     int rssi     = dev->getRSSI();
     uint8_t at   = dev->getAddress().getType();
     String ats   = (at==BLE_ADDR_RANDOM)?"random":"public";
-    addLog("  "+addrUp+" ["+ats+"] '"+name+"' rssi="+String(rssi));
+    bool wyze    = isWyzeDevice(dev);
+    addLog("  "+addrUp+" ["+ats+"] '"+name+"' rssi="+String(rssi)+(wyze?" [Wyze]":""));
     if(!first) json+=","; first=false;
-    json+="{\"addr\":\""+jsonEscape(addr)+"\",\"addrType\":\""+ats+"\",\"name\":\""+jsonEscape(name)+"\",\"rssi\":"+String(rssi)+"}";
+    json+="{\"addr\":\""+jsonEscape(addr)+"\",\"addrType\":\""+ats+"\",\"name\":\""+jsonEscape(name)+"\",\"rssi\":"+String(rssi)+",\"wyze\":"+String(wyze?"true":"false")+"}";
+
+    // Priority 1: exact address match
     if(!found&&!targetUpper.isEmpty()&&addrUp==targetUpper){ found=dev; addLog("  -> addr match"); }
+    // Priority 2: name match
     if(!found&&settings.bleName.length()&&name.length()){
       String n1=name; n1.toLowerCase(); String n2=settings.bleName; n2.toLowerCase();
       if(n1.indexOf(n2)>=0){ found=dev; addLog("  -> name match '"+name+"'"); currentTargetAddr=addr; }
     }
+    // Priority 3: Wyze manufacturer data fallback (Company ID 0x4459)
+    if(!found&&wyze){ found=dev; addLog("  -> Wyze mfr-data match"); currentTargetAddr=addr; }
   }
   json+="]"; lastScanJson=json;
   scanRunning=false;
@@ -328,6 +355,11 @@ String scanJson() {
 
 // --------------------------------------------------------------------------
 // BLE connect
+// FIX: Wyze keypad connects WITHOUT bonding/encryption (confirmed by nRF Connect).
+//      - Removed BLE_SM_PAIR_AUTHREQ_BOND from security flags in setup()
+//      - Removed secureConnection() call here
+//      - Raised BLE coex priority BEFORE connect(), not just during scan
+//      - connect() called with deleteAttrs=false to preserve service cache
 // --------------------------------------------------------------------------
 bool connectBle() {
   deleteBleClient();
@@ -348,21 +380,23 @@ bool connectBle() {
   addLog("Connecting to "+String(found->getAddress().toString().c_str())
          +" addrType="+String(found->getAddress().getType()));
 
+  // FIX: boost BLE coex priority for the connect window (WiFi was racing connect)
+  esp_coex_preference_set(ESP_COEX_PREFER_BT);
+
   bleClient=NimBLEDevice::createClient();
   bleClient->setClientCallbacks(&gClientCB, false);
   bleClient->setConnectionParams(24, 40, 0, 400);
-  bleClient->setConnectTimeout(15);
+  bleClient->setConnectTimeout(10);  // 10s is plenty; 15s was causing timeout loops
 
-  if(!bleClient->connect(found, true, false, false)) {
+  // FIX: pass deleteAttrs=false (was true) to keep attribute cache across reconnects
+  if(!bleClient->connect(found, false, false, false)) {
     addLog("connect() failed lastErr=0x"+String(bleClient->getLastError(), HEX));
     deleteBleClient(); esp_coex_preference_set(ESP_COEX_PREFER_BALANCE); return false;
   }
-  addLog("Link up — pairing (Just Works legacy)...");
+  addLog("Link up — no pairing required (device connects unencrypted)");
 
-  if(!bleClient->secureConnection()) {
-    addLog("secureConnection() failed lastErr=0x"+String(bleClient->getLastError(), HEX)
-           +" — continuing unencrypted");
-  }
+  // FIX: Do NOT call secureConnection() - WLCKKP1 is NOT BONDED per nRF Connect observation
+  // Calling it would cause a pairing attempt the device rejects, killing the link.
 
   bleClient->exchangeMTU();
   addLog("MTU="+String(bleClient->getMTU()));
@@ -392,6 +426,7 @@ bool connectBle() {
     } else addLog("Notify chr not subscribable");
   }
 
+  esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
   addLog("BLE ready");
   return true;
 }
@@ -559,12 +594,14 @@ void setup(){
   NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
   addLog("Own addr: "+String(NimBLEDevice::getAddress().toString().c_str()));
 
-  // Wyze Lock: Legacy Just Works, bond only, no MITM, no SC
-  NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND);
+  // FIX: WLCKKP1 does NOT bond or encrypt - observed as "NOT BONDED" in nRF Connect.
+  // Setting BOND flag causes the stack to wait for a pairing response that never comes.
+  // Use security flags = 0 (no requirements) so connect() completes immediately.
+  NimBLEDevice::setSecurityAuth(0);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
-  addLog("NimBLE init done, security: bond+JustWorks");
+  addLog("NimBLE init done, security: none (no-bond, no-encrypt)");
   setupWeb();
 
   unsigned long t0=millis();
