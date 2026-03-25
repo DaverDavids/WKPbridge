@@ -6,8 +6,10 @@
 //  r10:    Flip to PERIPHERAL mode (wrong -- keypad is peripheral)
 //  r10a-d: Various adv tuning, all wrong direction
 //  r10e:   ROLE REVERSAL: Bridge is CENTRAL, connects TO keypad
-//  r10f:   setCallbacks -> setClientCallbacks; fix getServices type
-//  r10g:   Fix 'auto*' deduction failure: explicit std::vector<NimBLERemoteService*>*
+//  r10f:   setCallbacks -> setClientCallbacks
+//  r10g:   Fix auto* deduction (still wrong -- pointer vs value)
+//  r10h:   Fix getServices() -- returns const value, use const ref
+//          Add UART1 serial sniffer (GPIO20=RX, GPIO21=TX) + web terminal
 
 #define DEBUG_SERIAL 1
 
@@ -42,6 +44,16 @@ static const uint8_t AES_KEY[16] = {
 };
 
 static const char *KEYPAD_MAC = "e2:79:a5:dc:36:4d";
+
+// UART1 sniffer -- GPIO20=RX (listen), GPIO21=TX (send)
+#define UART1_RX_PIN 20
+#define UART1_TX_PIN 21
+#define SERIAL1_BUF  4096
+static String  gSerial1Buf;
+static uint32_t gSerial1Baud   = 115200;
+static uint8_t  gSerial1Config = SERIAL_8N1;
+static bool     gSerial1Open   = false;
+static bool     gSerial1HexMode = false;  // false=ASCII, true=hex dump
 
 static NimBLEClient               *bleClient   = nullptr;
 static NimBLERemoteCharacteristic *txNotifyChr = nullptr;
@@ -117,6 +129,33 @@ bool parseHexString(String s,std::vector<uint8_t>&out){
     out.push_back((uint8_t)v);st=e+1;
   }
   return !out.empty();
+}
+
+// --------------------------------------------------------------------------
+// UART1 sniffer
+// --------------------------------------------------------------------------
+void serial1Open(uint32_t baud, uint8_t cfg){
+  if(gSerial1Open) Serial1.end();
+  gSerial1Baud=baud; gSerial1Config=cfg;
+  Serial1.begin(baud, cfg, UART1_RX_PIN, UART1_TX_PIN);
+  gSerial1Open=true;
+  addLog("UART1 open baud="+String(baud)+" cfg=0x"+String(cfg,HEX)+" RX=GPIO"+String(UART1_RX_PIN)+" TX=GPIO"+String(UART1_TX_PIN));
+}
+void serviceSerial1(){
+  if(!gSerial1Open) return;
+  while(Serial1.available()){
+    if(gSerial1HexMode){
+      uint8_t b=(uint8_t)Serial1.read();
+      const char *h="0123456789ABCDEF";
+      gSerial1Buf+=h[(b>>4)&0xF]; gSerial1Buf+=h[b&0xF]; gSerial1Buf+=' ';
+    } else {
+      char c=(char)Serial1.read();
+      if(c=='\r') continue;
+      gSerial1Buf+=c;
+    }
+    if(gSerial1Buf.length()>SERIAL1_BUF)
+      gSerial1Buf.remove(0, gSerial1Buf.length()-SERIAL1_BUF);
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -273,9 +312,9 @@ bool connectToKeypad(){
   NimBLERemoteService *nus=bleClient->getService(NUS_SERVICE_UUID);
   if(!nus){
     addLog("NUS NOT FOUND -- all services:");
-    // Explicit type to avoid auto* deduction failure in NimBLE 2.x
-    std::vector<NimBLERemoteService*> *svcs = bleClient->getServices(false);
-    if(svcs){ for(NimBLERemoteService *svc : *svcs) addLog("  "+String(svc->getUUID().toString().c_str())); }
+    // NimBLE 2.x getServices() returns const std::vector by value -- bind to const ref
+    const std::vector<NimBLERemoteService*> &svcs = *bleClient->getServices(false);
+    for(NimBLERemoteService *svc : svcs) addLog("  "+String(svc->getUUID().toString().c_str()));
     bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
   }
   addLog("NUS service found");
@@ -397,6 +436,9 @@ String makeStateJson(){
   json+="\"nonceReceived\":"+String(gNonceReceived?"true":"false")+",";
   json+="\"lastNonce\":\""+String(gNonceReceived?bytesToHex(gLastNonce,8):"")+"\",";
   json+="\"lastTx\":\""+jsonEscape(lastTxHex)+"\",\"lastRx\":\""+jsonEscape(lastRxHex)+"\",";
+  json+="\"uart1Open\":"+String(gSerial1Open?"true":"false")+",";
+  json+="\"uart1Baud\":"+String(gSerial1Baud)+",";
+  json+="\"uart1HexMode\":"+String(gSerial1HexMode?"true":"false")+",";
   json+="\"logs\":\""+jsonEscape(logBuffer)+"\",\"scan\":"+lastScanJson;
   json+="}";return json;
 }
@@ -423,6 +465,49 @@ void handleClearLog()  {logBuffer="";lastTxHex="";lastRxHex="";sendOk("Cleared")
 void handleReboot()    {sendOk("Rebooting");delay(200);ESP.restart();}
 void handleSendAuthResp(){sendAuthResp()?sendOk("Sent"):sendErr("Fail");}
 void handleSendNotify() {sendRawHex(server.arg("hex"))?sendOk("Sent"):sendErr("Fail");}
+
+// UART1 API handlers
+void handleSerial1Config(){
+  uint32_t baud = server.hasArg("baud") ? (uint32_t)server.arg("baud").toInt() : gSerial1Baud;
+  // cfg: 8N1=0x800001C, 8E1=0x2000018, 8O1=0x3000018, 7N1=0x800001A etc -- just support common ones by name
+  String cfgStr = server.hasArg("cfg") ? server.arg("cfg") : "8N1";
+  uint8_t cfg = SERIAL_8N1;
+  if(cfgStr=="8E1") cfg=SERIAL_8E1;
+  else if(cfgStr=="8O1") cfg=SERIAL_8O1;
+  else if(cfgStr=="7N1") cfg=SERIAL_7N1;
+  else if(cfgStr=="7E1") cfg=SERIAL_7E1;
+  else if(cfgStr=="7O1") cfg=SERIAL_7O1;
+  if(server.hasArg("hex")) gSerial1HexMode=(server.arg("hex")=="1"||server.arg("hex")=="true");
+  serial1Open(baud, cfg);
+  sendOk("UART1 opened baud="+String(baud)+" cfg="+cfgStr);
+}
+void handleSerial1Read(){
+  String data = gSerial1Buf;
+  gSerial1Buf = "";
+  server.send(200,"application/json","{\"ok\":true,\"data\":\""+jsonEscape(data)+"\",\"baud\":"+String(gSerial1Baud)+",\"open\":"+String(gSerial1Open?"true":"false")+"}");
+}
+void handleSerial1Write(){
+  if(!gSerial1Open){sendErr("UART1 not open");return;}
+  String hex=server.arg("hex");
+  String txt=server.arg("txt");
+  if(hex.length()){
+    std::vector<uint8_t>buf;
+    if(!parseHexString(hex,buf)){sendErr("hex parse");return;}
+    Serial1.write(buf.data(),buf.size());
+    sendOk("Sent "+String(buf.size())+" bytes hex");
+  } else if(txt.length()){
+    Serial1.print(txt);
+    sendOk("Sent "+String(txt.length())+" bytes txt");
+  } else {
+    sendErr("no data");
+  }
+}
+void handleSerial1Close(){
+  if(gSerial1Open){Serial1.end();gSerial1Open=false;}
+  sendOk("UART1 closed");
+}
+void handleSerial1ClearBuf(){gSerial1Buf="";sendOk("UART1 buf cleared");}
+
 void handleSaveConfig(){
   if(server.hasArg("scanSeconds")){int v=server.arg("scanSeconds").toInt();if(v<1)v=1;if(v>20)v=20;settings.scanSeconds=(uint8_t)v;}
   if(server.hasArg("mqttHost")) settings.mqttHost =server.arg("mqttHost");
@@ -451,6 +536,12 @@ void setupWeb(){
   server.on("/api/reboot",HTTP_POST,handleReboot);
   server.on("/api/sendAuthResp",HTTP_POST,handleSendAuthResp);
   server.on("/api/sendNotify",HTTP_POST,handleSendNotify);
+  // UART1 serial terminal
+  server.on("/api/serial/config",  HTTP_POST, handleSerial1Config);
+  server.on("/api/serial/read",    HTTP_GET,  handleSerial1Read);
+  server.on("/api/serial/write",   HTTP_POST, handleSerial1Write);
+  server.on("/api/serial/close",   HTTP_POST, handleSerial1Close);
+  server.on("/api/serial/clear",   HTTP_POST, handleSerial1ClearBuf);
   server.onNotFound([](){if(portalMode){server.sendHeader("Location","/",true);server.send(302,"text/plain","");}else server.send(404,"text/plain","Not found");});
   server.begin();addLog("HTTP started");
 }
@@ -468,11 +559,12 @@ void serviceBLE(){
   }
 }
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r10g");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r10h");
   loadSettings();
   addLog("AES key: "+bytesToHex(AES_KEY,16));
   addLog("Keypad MAC (target): "+String(KEYPAD_MAC));
-  addLog("r10g: CENTRAL -- connecting TO keypad");
+  addLog("r10h: CENTRAL -- connecting TO keypad");
+  addLog("UART1 sniffer: RX=GPIO"+String(UART1_RX_PIN)+" TX=GPIO"+String(UART1_TX_PIN)+" (use /api/serial/config to open)");
   WiFi.disconnect(true,true);delay(200);
   beginWiFi(false);
   NimBLEDevice::init("");
@@ -492,13 +584,14 @@ void loop(){
   server.handleClient();
   if(portalMode)dns.processNextRequest();
   if(otaReady&&WiFi.status()==WL_CONNECTED)ArduinoOTA.handle();
-  serviceWiFi();serviceMQTT();serviceBLE();
+  serviceWiFi();serviceMQTT();serviceBLE();serviceSerial1();
   if(millis()-lastStateMs>10000){
     lastStateMs=millis();
     addLog("heartbeat wifi="+String(WiFi.status()==WL_CONNECTED?"up":"down")
            +" ble="+String(gConnected?"CONNECTED":"disconnected")
            +" nonce="+String(gNonceReceived?"yes":"wait")
-           +" t+conn="+String((gConnected&&gConnectedAtMs)?(millis()-gConnectedAtMs):0)+"ms");
+           +" t+conn="+String((gConnected&&gConnectedAtMs)?(millis()-gConnectedAtMs):0)+"ms"
+           +" uart1="+String(gSerial1Open?String(gSerial1Baud)+"bd":"closed"));
   }
   delay(5);
 }
