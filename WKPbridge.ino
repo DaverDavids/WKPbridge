@@ -2,23 +2,18 @@
 // ESP32-C3 BLE-to-WiFi bridge for Wyze Wireless Keypad (WLCKKP1)
 //
 // Fix log:
-//  r1-r9: scan/connect/decompile/peripheral mode (see git history)
+//  r1-r9: scan/connect/decompile (see git history)
 //  r10:  Flip to PERIPHERAL mode -- keypad is the BLE central.
-//  r10a: Fix compile (remove setAdvertisementType).
-//  r10b: MAC byte order fix; tryLockMac; BT coex priority; tighter adv interval.
-//  r10c: KEY HYPOTHESIS -- keypad filters advertised service UUID.
-//        Scan of real lock shows only mfr data + name, no service UUIDs logged.
-//        We were advertising NUS (6e400001) in the adv packet -- real lock
-//        almost certainly advertises 0xFE50 (Wyze proprietary) in its adv,
-//        with NUS only visible in the GATT table AFTER connection.
-//        Changes:
-//        - Default adv now uses FE50 + 180F (not NUS + 180F).
-//        - NUS service still created in GATT (keypad will find it post-connect).
-//        - Added /api/advFe50 and /api/advNus toggles to switch at runtime.
-//        - scanJson() now logs ALL service UUIDs from every device (esp. real lock)
-//          so we can confirm what the real lock actually puts in its adv packet.
-//        - Removed dead connect/disconnect button logic (peripheral mode only).
-//        - gAdvUseNus flag controls which UUID goes in the adv packet.
+//  r10a: Fix compile.
+//  r10b: MAC byte order fix; tryLockMac; BT coex; tighter adv interval.
+//  r10c: Advertise FE50 UUID; log all adv UUIDs from scanned devices.
+//  r10d: SCAN RESULT -- real lock (E2:79:A5:DC:36:4D) adv contains:
+//          Service UUID: ONLY 0x180F (Battery Service)
+//          NO FE50, NO NUS in adv packet.
+//        FIX: Match real lock adv exactly:
+//          - Adv packet: name="Wyze Lock", svc=0x180F only, mfr=59 44 <MAC> 00 02 0A
+//          - NUS (6e400001/02/03) stays in GATT server only (keypad discovers post-connect).
+//        Added /api/advMode to toggle 180F-only vs 180F+FE50 at runtime.
 
 #define DEBUG_SERIAL 1
 
@@ -41,17 +36,11 @@ static const char *HOSTNAME = "WKPbridge";
 static const char *AP_SSID  = "WKPbridge-setup";
 static const byte DNS_PORT  = 53;
 
-// NUS (Nordic UART Service) -- used in GATT table, and optionally in adv
 static const char *NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 static const char *NUS_RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 static const char *NUS_TX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
-// Wyze proprietary service -- likely what real lock advertises in adv packet
-static const char *WYZE_SERVICE_UUID = "0000fe50-0000-1000-8000-00805f9b34fb";
-static const char *WYZE_ADV_UUID_SHORT = "fe50"; // short form for adv
-
 static const uint16_t WYZE_COMPANY_ID = 0x4459;
-
 static const char * const WYZE_ADV_NAMES[] = {
   "Wyze Lock", "DingDing", "KP-01", "DD-Fact", nullptr
 };
@@ -73,12 +62,12 @@ static uint32_t      gConnHandle    = 0xFFFF;
 static unsigned long gConnectedAtMs = 0;
 static String        gAdvPeer       = "";
 static bool          gUseLockMac    = false;
-static bool          gAdvUseNus     = false; // false=FE50 in adv (default), true=NUS in adv
+// advMode: 0=exact (180F only, default), 1=plus (180F+FE50)
+static int           gAdvMode       = 0;
 
 static uint8_t  gLastNonce[8] = {0};
 static bool     gNonceReceived = false;
 
-// legacy stubs
 NimBLEClient               *bleClient = nullptr;
 NimBLERemoteCharacteristic *writeChr  = nullptr;
 NimBLERemoteCharacteristic *notifyChr = nullptr;
@@ -138,7 +127,8 @@ bool parseHexString(String s,std::vector<uint8_t>&out){
   while(s.indexOf("  ")>=0)s.replace("  "," ");s.trim();if(s.isEmpty())return false;
   int st=0;
   while(st<(int)s.length()){
-    while(st<(int)s.length()&&s[st]==' ')st++;if(st>=(int)s.length())break;
+    while(st<(int)s.length()&&s[st]==' ')st++;
+    if(st>=(int)s.length())break;
     int e=s.indexOf(' ',st);if(e<0)e=s.length();
     String t=s.substring(st,e);t.trim();if(t.isEmpty()){st=e+1;continue;}
     if(t.length()>2)return false;
@@ -169,7 +159,6 @@ void loadSettings(){
   settings.mqttUser =prefs.getString("mqtt_user",""); settings.mqttPass=prefs.getString("mqtt_pass","");
   settings.mqttTopic=prefs.getString("mqtt_topic","wkpbridge");
   prefs.end();
-  // migrate old FE50 stored UUID
   if(settings.serviceUuid=="0000fe50-0000-1000-8000-00805f9b34fb"){
     settings.serviceUuid=NUS_SERVICE_UUID;
     settings.writeUuid  =NUS_RX_UUID;
@@ -203,7 +192,7 @@ void beginWiFi(bool keepAp){
   if(settings.wifiPsk.isEmpty()) settings.wifiPsk =MYPSK;
   addLog("WiFi SSID="+settings.wifiSsid);
   WiFi.begin(settings.wifiSsid.c_str(),settings.wifiPsk.c_str());
-  WiFi.setTxPower(WIFI_POWER_11dBm); lastWifiTryMs=millis();
+  WiFi.setTxPower(WIFI_POWER_15dBm); lastWifiTryMs=millis();
 }
 void ensureMDNSOTA(){
   if(WiFi.status()!=WL_CONNECTED)return;
@@ -235,7 +224,7 @@ bool sendNotify(const uint8_t *d,size_t l,const char *tag){
   lastTxHex=bytesToHex(d,l);
   addLog(String("TX NOTIFY ")+tag+": "+lastTxHex);
   bool ok=txChr->notify(d,l);
-  addLog(String("TX NOTIFY result: ")+(ok?"OK":"FAIL"));
+  addLog(String("TX result: ")+(ok?"OK":"FAIL"));
   return ok;
 }
 
@@ -259,13 +248,12 @@ void decodeRxPacket(const uint8_t *d,size_t l){
     uint8_t resp[8]={0};
     if(computeAuthResponse(gLastNonce,resp)){
       addLog("  -> AES resp: "+bytesToHex(resp,8));
-      delay(20);
-      bool ok=sendNotify(resp,8,"AUTH_RESP");
+      delay(20); bool ok=sendNotify(resp,8,"AUTH_RESP");
       addLog(ok?"  -> Auth OK":"  -> Auth FAILED");
     } else addLog("  -> AES FAILED");
     mqttPublish(bytesToHex(d,l)); return;
   }
-  addLog("  -> Unknown len="+String(l)+" raw");
+  addLog("  -> Unknown len="+String(l));
   mqttPublish(bytesToHex(d,l));
 }
 
@@ -280,7 +268,7 @@ public:
     addLog(">>> CONNECT peer="+gAdvPeer+" handle="+String(gConnHandle)+" t="+String(gConnectedAtMs)+"ms");
     addLog("    itvl="+String(info.getConnInterval())+" lat="+String(info.getConnLatency())+" tmo="+String(info.getConnTimeout())+" mtu="+String(info.getMTU()));
     NimBLEDevice::getAdvertising()->stop();
-    addLog("    Adv stopped. Waiting for keypad to subscribe+write...");
+    addLog("    Adv stopped. Waiting for subscribe+write...");
   }
   void onDisconnect(NimBLEServer*,NimBLEConnInfo &info,int reason) override {
     unsigned long dur=gConnectedAtMs?(millis()-gConnectedAtMs):0;
@@ -320,7 +308,7 @@ public:
 RxCharCB gRxCharCB;
 
 // --------------------------------------------------------------------------
-// Build mfr data (MAC MSB-first)
+// Build mfr data (MAC MSB-first in packet)
 // --------------------------------------------------------------------------
 void buildMfrData(uint8_t *out11,const uint8_t *mac6_msb){
   out11[0]=0x59;out11[1]=0x44;
@@ -329,22 +317,19 @@ void buildMfrData(uint8_t *out11,const uint8_t *mac6_msb){
 }
 
 // --------------------------------------------------------------------------
-// Advertising
-// r10c: default adv UUID is FE50 (Wyze proprietary), not NUS.
-// NUS stays in GATT only. Toggle with /api/advFe50 and /api/advNus.
+// Advertising -- r10d: 0x180F ONLY in adv (matches real lock exactly)
 // --------------------------------------------------------------------------
 void startAdvertising(){
   NimBLEAdvertising *adv=NimBLEDevice::getAdvertising();
   adv->reset();
 
-  if(gAdvUseNus){
-    adv->addServiceUUID(NUS_SERVICE_UUID);
-    addLog("Adv UUID: NUS (6e400001)");
+  adv->addServiceUUID("180f"); // Battery -- only UUID real lock puts in adv
+  if(gAdvMode==1){
+    adv->addServiceUUID("fe50");
+    addLog("Adv mode 1: 180F+FE50");
   } else {
-    adv->addServiceUUID(WYZE_ADV_UUID_SHORT); // 0xFE50
-    addLog("Adv UUID: FE50 (Wyze proprietary)");
+    addLog("Adv mode 0: 180F only (real lock match)");
   }
-  adv->addServiceUUID("180f"); // Battery
   adv->setName("Wyze Lock");
 
   uint8_t mfrData[11];
@@ -362,9 +347,8 @@ void startAdvertising(){
   adv->setMinInterval(32); adv->setMaxInterval(32);
 
   bool ok=adv->start();
-  addLog("Adv start: "+(ok?String("OK"):String("FAIL")));
-  addLog("  Mfr: "+bytesToHex(mfrData,11));
-  addLog("  Own addr: "+String(NimBLEDevice::getAddress().toString().c_str()));
+  addLog("Adv "+String(ok?"OK":"FAIL")+" mfr="+bytesToHex(mfrData,11));
+  addLog("  addr="+String(NimBLEDevice::getAddress().toString().c_str()));
 }
 void stopAdvertising(){NimBLEDevice::getAdvertising()->stop();addLog("Adv stopped");}
 
@@ -372,23 +356,20 @@ void stopAdvertising(){NimBLEDevice::getAdvertising()->stop();addLog("Adv stoppe
 // BLE peripheral setup
 // --------------------------------------------------------------------------
 void setupBlePeripheral(){
-  addLog("r10c: BLE peripheral setup");
+  addLog("r10d: BLE peripheral setup");
   NimBLEDevice::setSecurityAuth(0);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   bleServer=NimBLEDevice::createServer();
   bleServer->setCallbacks(&gServerCB);
 
-  // NUS in GATT (keypad discovers after connect)
   nusService=bleServer->createService(NUS_SERVICE_UUID);
   rxChr=nusService->createCharacteristic(NUS_RX_UUID,NIMBLE_PROPERTY::WRITE|NIMBLE_PROPERTY::WRITE_NR);
   rxChr->setCallbacks(&gRxCharCB);
   txChr=nusService->createCharacteristic(NUS_TX_UUID,NIMBLE_PROPERTY::NOTIFY);
   txChr->setCallbacks(&gRxCharCB);
   nusService->start();
-  addLog("  GATT NUS RX: "+String(NUS_RX_UUID));
-  addLog("  GATT NUS TX: "+String(NUS_TX_UUID));
-  addLog("  Adv UUID: "+(gAdvUseNus?String("NUS"):String("FE50")));
+  addLog("  GATT NUS (not in adv): RX="+String(NUS_RX_UUID));
 
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
   addLog("  Coex: BT priority");
@@ -396,36 +377,25 @@ void setupBlePeripheral(){
 }
 
 // --------------------------------------------------------------------------
-// Diagnostic scan -- log ALL service UUIDs for every device
+// Scan
 // --------------------------------------------------------------------------
 bool isWyzeDevice(const NimBLEAdvertisedDevice *dev){
   if(dev->haveManufacturerData()){const std::string &m=dev->getManufacturerData();if(m.size()>=2&&(((uint8_t)m[0]|((uint8_t)m[1]<<8))==WYZE_COMPANY_ID))return true;}
   if(dev->haveName()){std::string n=dev->getName();for(int i=0;WYZE_ADV_NAMES[i];i++)if(n==WYZE_ADV_NAMES[i])return true;}
   return false;
 }
-
 void logDeviceDetail(const NimBLEAdvertisedDevice *dev){
-  // Mfr data
   if(dev->haveManufacturerData()){
     const std::string &m=dev->getManufacturerData(); size_t len=m.size();
     String hex; for(size_t i=0;i<len;i++){const char*h="0123456789ABCDEF";hex+=h[((uint8_t)m[i]>>4)&0xF];hex+=h[(uint8_t)m[i]&0xF];if(i+1<len)hex+=' ';}
     addLog("    mfr("+String(len)+"b): "+hex);
-    if(len>=8){char ms[18];snprintf(ms,sizeof(ms),"%02X:%02X:%02X:%02X:%02X:%02X",(uint8_t)m[2],(uint8_t)m[3],(uint8_t)m[4],(uint8_t)m[5],(uint8_t)m[6],(uint8_t)m[7]);addLog("    -> mfr MAC: "+String(ms));}
-    if(len>10){uint8_t dt=(uint8_t)m[10];addLog("    -> devType=0x"+String(dt,HEX)+(dt==0x07?" KP-01":(dt==0x0A?" Wyze Lock":""))); }
+    if(len>=8){char ms[18];snprintf(ms,sizeof(ms),"%02X:%02X:%02X:%02X:%02X:%02X",(uint8_t)m[2],(uint8_t)m[3],(uint8_t)m[4],(uint8_t)m[5],(uint8_t)m[6],(uint8_t)m[7]);addLog("    mfrMAC: "+String(ms));}
+    if(len>10){uint8_t dt=(uint8_t)m[10];addLog("    devType=0x"+String(dt,HEX)+(dt==0x07?" KP-01":(dt==0x0A?" Wyze Lock":""))); }
   }
-  // ALL service UUIDs in the adv packet -- THIS IS THE KEY DATA WE NEED
-  int svcCount=dev->getServiceUUIDCount();
-  if(svcCount>0){
-    addLog("    Service UUIDs in adv ("+String(svcCount)+"):");
-    for(int i=0;i<svcCount;i++){
-      NimBLEUUID uuid=dev->getServiceUUID(i);
-      addLog("      ["+String(i)+"] "+String(uuid.toString().c_str()));
-    }
-  } else {
-    addLog("    No service UUIDs in adv packet");
-  }
-  // TX power
-  if(dev->haveTXPower()) addLog("    txPower="+String(dev->getTXPower())+" dBm");
+  int sc=dev->getServiceUUIDCount();
+  if(sc>0){addLog("    advUUIDs("+String(sc)+"):");for(int i=0;i<sc;i++){NimBLEUUID u=dev->getServiceUUID(i);addLog("      "+String(u.toString().c_str()));}}
+  else addLog("    No adv UUIDs");
+  if(dev->haveTXPower())addLog("    txPwr="+String(dev->getTXPower())+"dBm");
 }
 
 String scanJson(){
@@ -436,7 +406,7 @@ String scanJson(){
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
   NimBLEScan *scan=NimBLEDevice::getScan();
   scan->setActiveScan(true);scan->setInterval(40);scan->setWindow(40);scan->setDuplicateFilter(false);
-  addLog("BLE scan "+String(settings.scanSeconds)+"s (active, logging all UUIDs)");
+  addLog("BLE scan "+String(settings.scanSeconds)+"s");
   NimBLEScanResults results=scan->getResults((uint32_t)settings.scanSeconds*1000,false);
   addLog("Scan done: "+String(results.getCount())+" device(s)");
   String json="[";bool first=true;
@@ -449,7 +419,7 @@ String scanJson(){
     String ats=(addr.getType()==BLE_ADDR_RANDOM)?"random":"public";
     bool wyze=isWyzeDevice(dev);
     addLog("  "+addrStr+" ["+ats+"] '"+name+"' rssi="+String(rssi)+(wyze?" [Wyze]":""));
-    logDeviceDetail(dev); // logs mfr + ALL service UUIDs
+    logDeviceDetail(dev);
     if(!first)json+=",";first=false;
     json+="{\"addr\":\""+jsonEscape(addrStr)+"\",\"addrType\":\""+ats+"\",\"name\":\""+jsonEscape(name)+"\",\"rssi\":"+String(rssi)+",\"wyze\":"+String(wyze?"true":"false")+"}";
   }
@@ -501,7 +471,7 @@ String makeStateJson(){
   json+="\"advPeer\":\""+jsonEscape(gAdvPeer)+"\",";
   json+="\"tSinceConnMs\":"+String(tsc)+",";
   json+="\"ownBleAddr\":\""+String(NimBLEDevice::getAddress().toString().c_str())+"\",";
-  json+="\"advUuid\":\""+String(gAdvUseNus?"NUS":"FE50")+"\",";
+  json+="\"advMode\":"+String(gAdvMode)+",";
   json+="\"useLockMac\":"+String(gUseLockMac?"true":"false")+",";
   json+="\"realLockMac\":\""+bytesToHex(REAL_LOCK_MAC,6)+"\",";
   json+="\"bleConnected\":"+String(isBleReady()?"true":"false")+",";
@@ -562,17 +532,11 @@ void handleUseOwnMac(){
   NimBLEDevice::getAdvertising()->stop();delay(100);startAdvertising();
   sendOk("Adv with own MAC");
 }
-void handleAdvFe50(){
-  gAdvUseNus=false;
-  addLog("Adv UUID -> FE50");
+void handleAdvMode(){
+  if(server.hasArg("mode")) gAdvMode=server.arg("mode").toInt();
+  else gAdvMode=(gAdvMode==0)?1:0;
   NimBLEDevice::getAdvertising()->stop();delay(100);startAdvertising();
-  sendOk("Now advertising FE50 UUID");
-}
-void handleAdvNus(){
-  gAdvUseNus=true;
-  addLog("Adv UUID -> NUS");
-  NimBLEDevice::getAdvertising()->stop();delay(100);startAdvertising();
-  sendOk("Now advertising NUS UUID");
+  sendOk("advMode="+String(gAdvMode)+(gAdvMode==0?" (180F only)":" (180F+FE50)"));
 }
 void handleSendFF()    {sendNotify(PKT_FF,   sizeof(PKT_FF),   "FF"   )?sendOk("Sent"):sendErr("Fail");}
 void handleSendFE()    {sendNotify(PKT_FE,   sizeof(PKT_FE),   "FE"   )?sendOk("Sent"):sendErr("Fail");}
@@ -595,8 +559,7 @@ void setupWeb(){
   server.on("/api/stopAdv",HTTP_POST,handleStopAdv);
   server.on("/api/tryLockMac",HTTP_POST,handleTryLockMac);
   server.on("/api/useOwnMac",HTTP_POST,handleUseOwnMac);
-  server.on("/api/advFe50",HTTP_POST,handleAdvFe50);
-  server.on("/api/advNus",HTTP_POST,handleAdvNus);
+  server.on("/api/advMode",HTTP_POST,handleAdvMode);
   server.on("/api/sendFF",HTTP_POST,handleSendFF);
   server.on("/api/sendFE",HTTP_POST,handleSendFE);
   server.on("/api/sendBind",HTTP_POST,handleSendBind);
@@ -620,11 +583,11 @@ void serviceWiFi(){
 }
 
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r10c");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r10d");
   loadSettings();
   addLog("AES key: "+bytesToHex(AES_KEY,16));
   addLog("Real lock MAC: "+bytesToHex(REAL_LOCK_MAC,6));
-  addLog("r10c: BLE PERIPHERAL, adv UUID=FE50 (change at runtime via /api/advNus)");
+  addLog("r10d: PERIPHERAL, adv=180F only (real lock match)");
   WiFi.disconnect(true,true);delay(200);
   beginWiFi(false);
   NimBLEDevice::init("Wyze Lock");
@@ -650,7 +613,7 @@ void loop(){
     lastStateMs=millis();
     addLog("heartbeat wifi="+String(WiFi.status()==WL_CONNECTED?"up":"down")
            +" ble="+String(gAdvConnected?"CONNECTED":"adv")
-           +" advUUID="+String(gAdvUseNus?"NUS":"FE50")
+           +" advMode="+String(gAdvMode)
            +" lockMac="+String(gUseLockMac?"yes":"no")
            +" nonce="+String(gNonceReceived?"yes":"wait")
            +" t+conn="+String((gAdvConnected&&gConnectedAtMs)?(millis()-gConnectedAtMs):0)+"ms");
