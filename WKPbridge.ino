@@ -6,9 +6,8 @@
 //  r10:    Flip to PERIPHERAL mode (wrong -- keypad is peripheral)
 //  r10a-d: Various adv tuning, all wrong direction
 //  r10e:   ROLE REVERSAL: Bridge is CENTRAL, connects TO keypad
-//  r10f:   Fix NimBLE 2.x compile errors:
-//            setCallbacks -> setClientCallbacks
-//            getServices() returns ptr -- iterate with -> not dereference
+//  r10f:   setCallbacks -> setClientCallbacks; fix getServices type
+//  r10g:   Fix 'auto*' deduction failure: explicit std::vector<NimBLERemoteService*>*
 
 #define DEBUG_SERIAL 1
 
@@ -227,7 +226,7 @@ void onKeypadNotify(NimBLERemoteCharacteristic*, uint8_t *d, size_t l, bool isNo
 }
 
 // --------------------------------------------------------------------------
-// BLE client callbacks  (NimBLE 2.x: setClientCallbacks)
+// BLE client callbacks
 // --------------------------------------------------------------------------
 class ClientCB : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient *c) override {
@@ -254,7 +253,7 @@ bool connectToKeypad(){
 
   if(!bleClient){
     bleClient=NimBLEDevice::createClient();
-    bleClient->setClientCallbacks(&gClientCB);  // NimBLE 2.x API
+    bleClient->setClientCallbacks(&gClientCB);
     bleClient->setConnectionParams(12,12,0,51);
     bleClient->setConnectTimeout(5);
   }
@@ -274,9 +273,9 @@ bool connectToKeypad(){
   NimBLERemoteService *nus=bleClient->getService(NUS_SERVICE_UUID);
   if(!nus){
     addLog("NUS NOT FOUND -- all services:");
-    // NimBLE 2.x: getServices() returns std::vector<NimBLERemoteService*>*
-    auto *svcs=bleClient->getServices(false);
-    if(svcs){ for(auto svc:*svcs) addLog("  "+String(svc->getUUID().toString().c_str())); }
+    // Explicit type to avoid auto* deduction failure in NimBLE 2.x
+    std::vector<NimBLERemoteService*> *svcs = bleClient->getServices(false);
+    if(svcs){ for(NimBLERemoteService *svc : *svcs) addLog("  "+String(svc->getUUID().toString().c_str())); }
     bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
   }
   addLog("NUS service found");
@@ -469,11 +468,11 @@ void serviceBLE(){
   }
 }
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r10f");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r10g");
   loadSettings();
   addLog("AES key: "+bytesToHex(AES_KEY,16));
   addLog("Keypad MAC (target): "+String(KEYPAD_MAC));
-  addLog("r10f: CENTRAL -- connecting TO keypad");
+  addLog("r10g: CENTRAL -- connecting TO keypad");
   WiFi.disconnect(true,true);delay(200);
   beginWiFi(false);
   NimBLEDevice::init("");
