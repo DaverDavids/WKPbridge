@@ -7,9 +7,11 @@
 //  r10a-d: Various adv tuning, all wrong direction
 //  r10e:   ROLE REVERSAL: Bridge is CENTRAL, connects TO keypad
 //  r10f:   setCallbacks -> setClientCallbacks
-//  r10g:   Fix auto* deduction (still wrong -- pointer vs value)
-//  r10h:   Fix getServices() -- returns const value, use const ref
-//          Add UART1 serial sniffer (GPIO20=RX, GPIO21=TX) + web terminal
+//  r10g:   Fix auto* deduction
+//  r10h:   getServices const ref; UART1 sniffer added
+//  r10i:   NimBLE 2.x fixes:
+//            - remove discoverAttributes() (does not exist in 2.x)
+//            - getServices() returns value not pointer; remove * dereference
 
 #define DEBUG_SERIAL 1
 
@@ -49,11 +51,11 @@ static const char *KEYPAD_MAC = "e2:79:a5:dc:36:4d";
 #define UART1_RX_PIN 20
 #define UART1_TX_PIN 21
 #define SERIAL1_BUF  4096
-static String  gSerial1Buf;
-static uint32_t gSerial1Baud   = 115200;
-static uint8_t  gSerial1Config = SERIAL_8N1;
-static bool     gSerial1Open   = false;
-static bool     gSerial1HexMode = false;  // false=ASCII, true=hex dump
+static String   gSerial1Buf;
+static uint32_t gSerial1Baud    = 115200;
+static uint8_t  gSerial1Config  = SERIAL_8N1;
+static bool     gSerial1Open    = false;
+static bool     gSerial1HexMode = false;
 
 static NimBLEClient               *bleClient   = nullptr;
 static NimBLERemoteCharacteristic *txNotifyChr = nullptr;
@@ -218,7 +220,7 @@ bool computeAuthResponse(const uint8_t *nonce8, uint8_t *resp8){
 }
 
 // --------------------------------------------------------------------------
-// Write to keypad RX characteristic
+// Write to keypad RX characteristic (bridge -> keypad)
 // --------------------------------------------------------------------------
 bool writeToKeypad(const uint8_t *d, size_t l, const char *tag){
   if(!gConnected||!rxWriteChr){addLog(String("WRITE failed: not connected - ")+tag);return false;}
@@ -235,10 +237,10 @@ bool writeToKeypad(const uint8_t *d, size_t l, const char *tag){
 void onKeypadNotify(NimBLERemoteCharacteristic*, uint8_t *d, size_t l, bool isNotify){
   lastRxHex=bytesToHex(d,l);
   unsigned long t=gConnectedAtMs?(millis()-gConnectedAtMs):0;
-  addLog("KP->LOCK notify len="+String(l)+" t+"+String(t)+"ms");
+  addLog("KP->BRIDGE notify len="+String(l)+" t+"+String(t)+"ms");
   addLog("  RAW: "+lastRxHex);
   if(l==8){
-    addLog("  -> 8-byte NONCE from keypad");
+    addLog("  -> 8-byte NONCE");
     memcpy(gLastNonce,d,8); gNonceReceived=true;
     uint8_t resp[8]={0};
     if(computeAuthResponse(gLastNonce,resp)){
@@ -260,7 +262,7 @@ void onKeypadNotify(NimBLERemoteCharacteristic*, uint8_t *d, size_t l, bool isNo
     addLog("  -> dd_proto op="+opName+" payload="+((l>5)?bytesToHex(d+5,l-5):String("(none)")));
     mqttPublish(lastRxHex); return;
   }
-  addLog("  -> Unknown packet len="+String(l));
+  addLog("  -> Unknown len="+String(l));
   mqttPublish(lastRxHex);
 }
 
@@ -302,19 +304,16 @@ bool connectToKeypad(){
     addLog("Connect FAILED");
     gConnecting=false; gLastConnTryMs=millis(); return false;
   }
-
-  addLog("Connected! Discovering services...");
-  if(!bleClient->discoverAttributes()){
-    addLog("Service discovery FAILED");
-    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
-  }
+  // NimBLE 2.x: connect() triggers service/char discovery automatically.
+  // getService() will use cached results.
 
   NimBLERemoteService *nus=bleClient->getService(NUS_SERVICE_UUID);
   if(!nus){
     addLog("NUS NOT FOUND -- all services:");
-    // NimBLE 2.x getServices() returns const std::vector by value -- bind to const ref
-    const std::vector<NimBLERemoteService*> &svcs = *bleClient->getServices(false);
-    for(NimBLERemoteService *svc : svcs) addLog("  "+String(svc->getUUID().toString().c_str()));
+    // NimBLE 2.x getServices() returns a const std::vector by value -- no pointer, no dereference
+    std::vector<NimBLERemoteService*> svcs = bleClient->getServices(true);
+    for(NimBLERemoteService *svc : svcs)
+      addLog("  svc: "+String(svc->getUUID().toString().c_str()));
     bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
   }
   addLog("NUS service found");
@@ -465,49 +464,32 @@ void handleClearLog()  {logBuffer="";lastTxHex="";lastRxHex="";sendOk("Cleared")
 void handleReboot()    {sendOk("Rebooting");delay(200);ESP.restart();}
 void handleSendAuthResp(){sendAuthResp()?sendOk("Sent"):sendErr("Fail");}
 void handleSendNotify() {sendRawHex(server.arg("hex"))?sendOk("Sent"):sendErr("Fail");}
-
-// UART1 API handlers
 void handleSerial1Config(){
-  uint32_t baud = server.hasArg("baud") ? (uint32_t)server.arg("baud").toInt() : gSerial1Baud;
-  // cfg: 8N1=0x800001C, 8E1=0x2000018, 8O1=0x3000018, 7N1=0x800001A etc -- just support common ones by name
-  String cfgStr = server.hasArg("cfg") ? server.arg("cfg") : "8N1";
-  uint8_t cfg = SERIAL_8N1;
-  if(cfgStr=="8E1") cfg=SERIAL_8E1;
-  else if(cfgStr=="8O1") cfg=SERIAL_8O1;
-  else if(cfgStr=="7N1") cfg=SERIAL_7N1;
-  else if(cfgStr=="7E1") cfg=SERIAL_7E1;
-  else if(cfgStr=="7O1") cfg=SERIAL_7O1;
-  if(server.hasArg("hex")) gSerial1HexMode=(server.arg("hex")=="1"||server.arg("hex")=="true");
-  serial1Open(baud, cfg);
+  uint32_t baud=server.hasArg("baud")?(uint32_t)server.arg("baud").toInt():gSerial1Baud;
+  String cfgStr=server.hasArg("cfg")?server.arg("cfg"):"8N1";
+  uint8_t cfg=SERIAL_8N1;
+  if(cfgStr=="8E1")cfg=SERIAL_8E1;
+  else if(cfgStr=="8O1")cfg=SERIAL_8O1;
+  else if(cfgStr=="7N1")cfg=SERIAL_7N1;
+  else if(cfgStr=="7E1")cfg=SERIAL_7E1;
+  else if(cfgStr=="7O1")cfg=SERIAL_7O1;
+  if(server.hasArg("hex"))gSerial1HexMode=(server.arg("hex")=="1"||server.arg("hex")=="true");
+  serial1Open(baud,cfg);
   sendOk("UART1 opened baud="+String(baud)+" cfg="+cfgStr);
 }
 void handleSerial1Read(){
-  String data = gSerial1Buf;
-  gSerial1Buf = "";
+  String data=gSerial1Buf; gSerial1Buf="";
   server.send(200,"application/json","{\"ok\":true,\"data\":\""+jsonEscape(data)+"\",\"baud\":"+String(gSerial1Baud)+",\"open\":"+String(gSerial1Open?"true":"false")+"}");
 }
 void handleSerial1Write(){
   if(!gSerial1Open){sendErr("UART1 not open");return;}
-  String hex=server.arg("hex");
-  String txt=server.arg("txt");
-  if(hex.length()){
-    std::vector<uint8_t>buf;
-    if(!parseHexString(hex,buf)){sendErr("hex parse");return;}
-    Serial1.write(buf.data(),buf.size());
-    sendOk("Sent "+String(buf.size())+" bytes hex");
-  } else if(txt.length()){
-    Serial1.print(txt);
-    sendOk("Sent "+String(txt.length())+" bytes txt");
-  } else {
-    sendErr("no data");
-  }
+  String hex=server.arg("hex"); String txt=server.arg("txt");
+  if(hex.length()){std::vector<uint8_t>buf;if(!parseHexString(hex,buf)){sendErr("hex parse");return;}Serial1.write(buf.data(),buf.size());sendOk("Sent "+String(buf.size())+"b hex");}
+  else if(txt.length()){Serial1.print(txt);sendOk("Sent "+String(txt.length())+"b txt");}
+  else sendErr("no data");
 }
-void handleSerial1Close(){
-  if(gSerial1Open){Serial1.end();gSerial1Open=false;}
-  sendOk("UART1 closed");
-}
+void handleSerial1Close(){if(gSerial1Open){Serial1.end();gSerial1Open=false;}sendOk("UART1 closed");}
 void handleSerial1ClearBuf(){gSerial1Buf="";sendOk("UART1 buf cleared");}
-
 void handleSaveConfig(){
   if(server.hasArg("scanSeconds")){int v=server.arg("scanSeconds").toInt();if(v<1)v=1;if(v>20)v=20;settings.scanSeconds=(uint8_t)v;}
   if(server.hasArg("mqttHost")) settings.mqttHost =server.arg("mqttHost");
@@ -536,12 +518,11 @@ void setupWeb(){
   server.on("/api/reboot",HTTP_POST,handleReboot);
   server.on("/api/sendAuthResp",HTTP_POST,handleSendAuthResp);
   server.on("/api/sendNotify",HTTP_POST,handleSendNotify);
-  // UART1 serial terminal
-  server.on("/api/serial/config",  HTTP_POST, handleSerial1Config);
-  server.on("/api/serial/read",    HTTP_GET,  handleSerial1Read);
-  server.on("/api/serial/write",   HTTP_POST, handleSerial1Write);
-  server.on("/api/serial/close",   HTTP_POST, handleSerial1Close);
-  server.on("/api/serial/clear",   HTTP_POST, handleSerial1ClearBuf);
+  server.on("/api/serial/config",HTTP_POST,handleSerial1Config);
+  server.on("/api/serial/read",HTTP_GET,handleSerial1Read);
+  server.on("/api/serial/write",HTTP_POST,handleSerial1Write);
+  server.on("/api/serial/close",HTTP_POST,handleSerial1Close);
+  server.on("/api/serial/clear",HTTP_POST,handleSerial1ClearBuf);
   server.onNotFound([](){if(portalMode){server.sendHeader("Location","/",true);server.send(302,"text/plain","");}else server.send(404,"text/plain","Not found");});
   server.begin();addLog("HTTP started");
 }
@@ -559,12 +540,12 @@ void serviceBLE(){
   }
 }
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r10h");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r10i");
   loadSettings();
   addLog("AES key: "+bytesToHex(AES_KEY,16));
   addLog("Keypad MAC (target): "+String(KEYPAD_MAC));
-  addLog("r10h: CENTRAL -- connecting TO keypad");
-  addLog("UART1 sniffer: RX=GPIO"+String(UART1_RX_PIN)+" TX=GPIO"+String(UART1_TX_PIN)+" (use /api/serial/config to open)");
+  addLog("r10i: CENTRAL -- connecting TO keypad");
+  addLog("UART1 sniffer: RX=GPIO"+String(UART1_RX_PIN)+" TX=GPIO"+String(UART1_TX_PIN));
   WiFi.disconnect(true,true);delay(200);
   beginWiFi(false);
   NimBLEDevice::init("");
