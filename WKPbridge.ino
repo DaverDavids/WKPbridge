@@ -5,12 +5,10 @@
 //  r1-r9:  scan/connect/decompile (see git history)
 //  r10:    Flip to PERIPHERAL mode (wrong -- keypad is peripheral)
 //  r10a-d: Various adv tuning, all wrong direction
-//  r10e:   ROLE REVERSAL CONFIRMED:
-//            Keypad = BLE PERIPHERAL (advertises 'Wyze Lock', 0x180F, mfr MAC E2:79:A5:DC:36:4D)
-//            Lock   = BLE CENTRAL    (connects TO the keypad)
-//          Bridge is now CENTRAL: scans for keypad MAC, connects, discovers NUS,
-//          subscribes TX notify, handles auth exchange as the central/lock side.
-//          Auto-reconnect every 5s if disconnected.
+//  r10e:   ROLE REVERSAL: Bridge is CENTRAL, connects TO keypad
+//  r10f:   Fix NimBLE 2.x compile errors:
+//            setCallbacks -> setClientCallbacks
+//            getServices() returns ptr -- iterate with -> not dereference
 
 #define DEBUG_SERIAL 1
 
@@ -34,8 +32,8 @@ static const char *AP_SSID  = "WKPbridge-setup";
 static const byte DNS_PORT  = 53;
 
 static const char *NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-static const char *NUS_RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // keypad writes here (lock->kp)
-static const char *NUS_TX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // keypad notifies here (kp->lock)
+static const char *NUS_RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+static const char *NUS_TX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 static const uint16_t WYZE_COMPANY_ID = 0x4459;
 
@@ -44,21 +42,18 @@ static const uint8_t AES_KEY[16] = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-// Keypad MAC (confirmed from scan -- this is what we connect TO)
-static const char *KEYPAD_MAC     = "e2:79:a5:dc:36:4d";
-static const uint8_t KEYPAD_MAC_B[6] = {0xE2,0x79,0xA5,0xDC,0x36,0x4D};
+static const char *KEYPAD_MAC = "e2:79:a5:dc:36:4d";
 
-// ---- Central/client state ----
-static NimBLEClient               *bleClient  = nullptr;
-static NimBLERemoteCharacteristic *txNotifyChr = nullptr; // keypad TX (we subscribe)
-static NimBLERemoteCharacteristic *rxWriteChr  = nullptr; // keypad RX (we write)
-static bool          gConnected    = false;
+static NimBLEClient               *bleClient   = nullptr;
+static NimBLERemoteCharacteristic *txNotifyChr = nullptr;
+static NimBLERemoteCharacteristic *rxWriteChr  = nullptr;
+static bool          gConnected     = false;
 static unsigned long gConnectedAtMs = 0;
 static unsigned long gLastConnTryMs = 0;
-static bool          gConnecting   = false;
+static bool          gConnecting    = false;
 
-static uint8_t  gLastNonce[8] = {0};
-static bool     gNonceReceived = false;
+static uint8_t gLastNonce[8] = {0};
+static bool    gNonceReceived = false;
 
 #if DEBUG_SERIAL
   #define DBG_BEGIN(x)   Serial.begin(x)
@@ -185,7 +180,7 @@ bool computeAuthResponse(const uint8_t *nonce8, uint8_t *resp8){
 }
 
 // --------------------------------------------------------------------------
-// Write to keypad RX characteristic (lock -> keypad direction)
+// Write to keypad RX characteristic
 // --------------------------------------------------------------------------
 bool writeToKeypad(const uint8_t *d, size_t l, const char *tag){
   if(!gConnected||!rxWriteChr){addLog(String("WRITE failed: not connected - ")+tag);return false;}
@@ -197,15 +192,13 @@ bool writeToKeypad(const uint8_t *d, size_t l, const char *tag){
 }
 
 // --------------------------------------------------------------------------
-// Notify callback -- keypad TX -> us (keypad->lock direction)
+// Notify callback -- keypad TX -> bridge
 // --------------------------------------------------------------------------
 void onKeypadNotify(NimBLERemoteCharacteristic*, uint8_t *d, size_t l, bool isNotify){
   lastRxHex=bytesToHex(d,l);
   unsigned long t=gConnectedAtMs?(millis()-gConnectedAtMs):0;
   addLog("KP->LOCK notify len="+String(l)+" t+"+String(t)+"ms");
   addLog("  RAW: "+lastRxHex);
-
-  // 8-byte nonce: keypad sends this as auth challenge after subscribe
   if(l==8){
     addLog("  -> 8-byte NONCE from keypad");
     memcpy(gLastNonce,d,8); gNonceReceived=true;
@@ -218,8 +211,6 @@ void onKeypadNotify(NimBLERemoteCharacteristic*, uint8_t *d, size_t l, bool isNo
     } else addLog("  -> AES FAILED");
     mqttPublish(lastRxHex); return;
   }
-
-  // dd_proto packets
   if(l>=5&&d[0]==0xDE&&d[1]==0xC0&&d[2]==0xAD&&d[3]==0xDE){
     uint8_t op=d[4]; String opName;
     switch(op){
@@ -228,31 +219,27 @@ void onKeypadNotify(NimBLERemoteCharacteristic*, uint8_t *d, size_t l, bool isNo
       case 0xFF:opName="GET_RANDOM";break;
       default:opName="OP_0x"+String(op,HEX);
     }
-    String payload=(l>5)?bytesToHex(d+5,l-5):"(none)";
-    addLog("  -> dd_proto op="+opName+" payload="+payload);
+    addLog("  -> dd_proto op="+opName+" payload="+((l>5)?bytesToHex(d+5,l-5):String("(none)")));
     mqttPublish(lastRxHex); return;
   }
-
   addLog("  -> Unknown packet len="+String(l));
   mqttPublish(lastRxHex);
 }
 
 // --------------------------------------------------------------------------
-// BLE client callbacks
+// BLE client callbacks  (NimBLE 2.x: setClientCallbacks)
 // --------------------------------------------------------------------------
 class ClientCB : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient *c) override {
     gConnected=true; gConnectedAtMs=millis(); gConnecting=false;
-    addLog(">>> CONNECTED to keypad "+String(c->getPeerAddress().toString().c_str())
-           +" t="+String(gConnectedAtMs)+"ms");
+    addLog(">>> CONNECTED to keypad "+String(c->getPeerAddress().toString().c_str()));
   }
   void onDisconnect(NimBLEClient *c, int reason) override {
     unsigned long dur=gConnectedAtMs?(millis()-gConnectedAtMs):0;
-    addLog(">>> DISCONNECTED from keypad reason=0x"+String(reason,HEX)
-           +" dur="+String(dur)+"ms nonceRx="+String(gNonceReceived?"YES":"NO"));
+    addLog(">>> DISCONNECTED reason=0x"+String(reason,HEX)+" dur="+String(dur)+"ms nonce="+String(gNonceReceived?"YES":"NO"));
     gConnected=false; gConnectedAtMs=0; gConnecting=false;
     gNonceReceived=false; txNotifyChr=nullptr; rxWriteChr=nullptr;
-    gLastConnTryMs=millis(); // back off before retry
+    gLastConnTryMs=millis();
   }
 };
 ClientCB gClientCB;
@@ -267,58 +254,49 @@ bool connectToKeypad(){
 
   if(!bleClient){
     bleClient=NimBLEDevice::createClient();
-    bleClient->setCallbacks(&gClientCB);
-    bleClient->setConnectionParams(12,12,0,51); // 15ms interval, 510ms timeout
+    bleClient->setClientCallbacks(&gClientCB);  // NimBLE 2.x API
+    bleClient->setConnectionParams(12,12,0,51);
     bleClient->setConnectTimeout(5);
   }
 
   NimBLEAddress kpAddr(KEYPAD_MAC, BLE_ADDR_RANDOM);
   if(!bleClient->connect(kpAddr)){
     addLog("Connect FAILED");
-    gConnecting=false; gLastConnTryMs=millis();
-    return false;
+    gConnecting=false; gLastConnTryMs=millis(); return false;
   }
 
   addLog("Connected! Discovering services...");
   if(!bleClient->discoverAttributes()){
     addLog("Service discovery FAILED");
-    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis();
-    return false;
+    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
   }
 
   NimBLERemoteService *nus=bleClient->getService(NUS_SERVICE_UUID);
   if(!nus){
-    addLog("NUS service NOT FOUND -- dumping all services:");
-    for(auto &svc:*bleClient->getServices(true)){
-      addLog("  svc: "+String(svc->getUUID().toString().c_str()));
-    }
-    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis();
-    return false;
+    addLog("NUS NOT FOUND -- all services:");
+    // NimBLE 2.x: getServices() returns std::vector<NimBLERemoteService*>*
+    auto *svcs=bleClient->getServices(false);
+    if(svcs){ for(auto svc:*svcs) addLog("  "+String(svc->getUUID().toString().c_str())); }
+    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
   }
   addLog("NUS service found");
 
   txNotifyChr=nus->getCharacteristic(NUS_TX_UUID);
   rxWriteChr =nus->getCharacteristic(NUS_RX_UUID);
-
   if(!txNotifyChr||!rxWriteChr){
-    addLog("NUS characteristics NOT FOUND tx="+String(txNotifyChr?"OK":"MISSING")
-           +" rx="+String(rxWriteChr?"OK":"MISSING"));
-    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis();
-    return false;
+    addLog("NUS chr MISSING tx="+String(txNotifyChr?"OK":"NO")+" rx="+String(rxWriteChr?"OK":"NO"));
+    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
   }
-
   if(!txNotifyChr->canNotify()){
-    addLog("TX chr cannot notify!");
-    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis();
-    return false;
+    addLog("TX chr cannot notify");
+    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
   }
 
   addLog("Subscribing to keypad TX notify...");
   bool subOk=txNotifyChr->subscribe(true, onKeypadNotify, false);
   addLog("Subscribe: "+(subOk?String("OK"):String("FAIL")));
   if(!subOk){
-    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis();
-    return false;
+    bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
   }
 
   addLog("Ready. Waiting for keypad nonce...");
@@ -327,11 +305,11 @@ bool connectToKeypad(){
 }
 
 // --------------------------------------------------------------------------
-// Scan (diagnostic only)
+// Scan (diagnostic)
 // --------------------------------------------------------------------------
 bool isWyzeDevice(const NimBLEAdvertisedDevice *dev){
   if(dev->haveManufacturerData()){const std::string &m=dev->getManufacturerData();if(m.size()>=2&&(((uint8_t)m[0]|((uint8_t)m[1]<<8))==WYZE_COMPANY_ID))return true;}
-  if(dev->haveName()){std::string n=dev->getName();if(n=="Wyze Lock"||n=="KP-01"||n=="DingDing"||n=="DD-Fact")return true;}
+  if(dev->haveName()){std::string n=dev->getName();if(n=="Wyze Lock"||n=="KP-01"||n=="DingDing")return true;}
   return false;
 }
 void logDeviceDetail(const NimBLEAdvertisedDevice *dev){
@@ -346,12 +324,10 @@ void logDeviceDetail(const NimBLEAdvertisedDevice *dev){
   if(sc>0){addLog("    advUUIDs("+String(sc)+"):");for(int i=0;i<sc;i++)addLog("      "+String(dev->getServiceUUID(i).toString().c_str()));}
   else addLog("    No adv UUIDs");
 }
-
 String scanJson(){
   if(gConnected){addLog("Scan skipped: connected");return lastScanJson;}
   if(scanRunning){addLog("Scan busy");return lastScanJson;}
   scanRunning=true;
-  esp_coex_preference_set(ESP_COEX_PREFER_BT);
   NimBLEScan *scan=NimBLEDevice::getScan();
   scan->setActiveScan(true);scan->setInterval(40);scan->setWindow(40);scan->setDuplicateFilter(false);
   addLog("BLE scan "+String(settings.scanSeconds)+"s");
@@ -381,13 +357,11 @@ String scanJson(){
 // Packet helpers
 // --------------------------------------------------------------------------
 bool isBleReady(){return gConnected&&rxWriteChr;}
-
 static const uint8_t PKT_FF[8]    ={0xDE,0xC0,0xAD,0xDE,0xFF,0x01,0x1E,0xF1};
 static const uint8_t PKT_FE[8]    ={0xDE,0xC0,0xAD,0xDE,0xFE,0x01,0x1E,0xF1};
 static const uint8_t PKT_BIND[8]  ={0xDE,0xC0,0xAD,0xDE,0x01,0x1E,0xF1,0x00};
 static const uint8_t PKT_UNLOCK[8]={0xDE,0xC0,0xAD,0xDE,0x00,0x01,0x1E,0xF1};
 static const uint8_t PKT_KP[8]    ={0xDE,0xC0,0xAD,0xDE,0x02,0x01,0x1E,0xF1};
-
 bool sendAuthResp(){
   if(!gNonceReceived){addLog("No nonce yet");return false;}
   uint8_t resp[8]={0};
@@ -433,15 +407,11 @@ String makeStateJson(){
 // --------------------------------------------------------------------------
 void sendOk(const String &m){server.send(200,"application/json","{\"ok\":true,\"msg\":\""+jsonEscape(m)+"\"}");}
 void sendErr(const String &m){server.send(200,"application/json","{\"ok\":false,\"msg\":\""+jsonEscape(m)+"\"}");}
-
 void handleRoot()    {server.send_P(200,"text/html",INDEX_HTML);}
 void handleState()   {server.send(200,"application/json",makeStateJson());}
 void handleScan()    {server.send(200,"application/json",scanJson());}
 void handleConnect() {connectToKeypad()?sendOk("Connected"):sendErr("Failed");}
-void handleDisconnect(){
-  if(bleClient&&bleClient->isConnected())bleClient->disconnect();
-  sendOk("Disconnected");
-}
+void handleDisconnect(){if(bleClient&&bleClient->isConnected())bleClient->disconnect();sendOk("Disconnected");}
 void handleSaveWifi(){settings.wifiSsid=server.arg("ssid");settings.wifiPsk=server.arg("psk");saveSettings();beginWiFi(portalMode);sendOk("WiFi saved");}
 void handleClearBonds(){NimBLEDevice::deleteAllBonds();addLog("Bonds cleared");sendOk("Bonds cleared");}
 void handleSendFF()    {writeToKeypad(PKT_FF,   sizeof(PKT_FF),   "FF"   )?sendOk("Sent"):sendErr("Fail");}
@@ -463,7 +433,6 @@ void handleSaveConfig(){
   if(server.hasArg("mqttTopic"))settings.mqttTopic=server.arg("mqttTopic");
   saveSettings();sendOk("Config saved");
 }
-
 void setupWeb(){
   server.on("/",HTTP_GET,handleRoot);
   server.on("/api/state",HTTP_GET,handleState);
@@ -486,29 +455,25 @@ void setupWeb(){
   server.onNotFound([](){if(portalMode){server.sendHeader("Location","/",true);server.send(302,"text/plain","");}else server.send(404,"text/plain","Not found");});
   server.begin();addLog("HTTP started");
 }
-
 void serviceWiFi(){
   bool up=(WiFi.status()==WL_CONNECTED);
   if(up&&!wifiWasConnected){wifiWasConnected=true;addLog("WiFi up: "+WiFi.localIP().toString());ensureMDNSOTA();stopPortal();}
   if(!up&&wifiWasConnected){wifiWasConnected=false;addLog("WiFi down");lastWifiTryMs=millis();}
   if(!up){if(millis()-lastWifiTryMs>15000)beginWiFi(portalMode);if(!portalMode&&millis()>30000&&millis()-lastWifiTryMs>10000)startPortal();}
 }
-
 void serviceBLE(){
   if(gConnected||gConnecting||scanRunning)return;
-  // Auto-reconnect every 5s
   if(millis()-gLastConnTryMs>5000){
     gLastConnTryMs=millis();
     connectToKeypad();
   }
 }
-
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r10e");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r10f");
   loadSettings();
   addLog("AES key: "+bytesToHex(AES_KEY,16));
   addLog("Keypad MAC (target): "+String(KEYPAD_MAC));
-  addLog("r10e: CENTRAL mode -- connecting TO keypad");
+  addLog("r10f: CENTRAL -- connecting TO keypad");
   WiFi.disconnect(true,true);delay(200);
   beginWiFi(false);
   NimBLEDevice::init("");
@@ -524,7 +489,6 @@ void setup(){
   else ensureMDNSOTA();
   addLog("Will auto-connect to keypad in 5s...");
 }
-
 void loop(){
   server.handleClient();
   if(portalMode)dns.processNextRequest();
@@ -533,8 +497,7 @@ void loop(){
   if(millis()-lastStateMs>10000){
     lastStateMs=millis();
     addLog("heartbeat wifi="+String(WiFi.status()==WL_CONNECTED?"up":"down")
-           +" ble="+String(gConnected?"CONNECTED":"scanning")
-           +" keypad="+String(KEYPAD_MAC)
+           +" ble="+String(gConnected?"CONNECTED":"disconnected")
            +" nonce="+String(gNonceReceived?"yes":"wait")
            +" t+conn="+String((gConnected&&gConnectedAtMs)?(millis()-gConnectedAtMs):0)+"ms");
   }
