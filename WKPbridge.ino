@@ -9,9 +9,10 @@
 //  r10f:   setCallbacks -> setClientCallbacks
 //  r10g:   Fix auto* deduction
 //  r10h:   getServices const ref; UART1 sniffer added
-//  r10i:   NimBLE 2.x fixes:
-//            - remove discoverAttributes() (does not exist in 2.x)
-//            - getServices() returns value not pointer; remove * dereference
+//  r10i:   NimBLE 2.x fixes: remove discoverAttributes(); fix getServices() deref
+//  r10j:   Scan-first connect -- keypad uses rotating random addr; find live addr
+//          via short active scan before each connect attempt.
+//          Also restore UI scan table.
 
 #define DEBUG_SERIAL 1
 
@@ -45,7 +46,8 @@ static const uint8_t AES_KEY[16] = {
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-static const char *KEYPAD_MAC = "e2:79:a5:dc:36:4d";
+// Fallback/hint MAC -- actual connect uses live scan result
+static const char *KEYPAD_MAC_HINT = "e2:79:a5:dc:36:4d";
 
 // UART1 sniffer -- GPIO20=RX (listen), GPIO21=TX (send)
 #define UART1_RX_PIN 20
@@ -65,6 +67,10 @@ static unsigned long gConnectedAtMs = 0;
 static unsigned long gLastConnTryMs = 0;
 static bool          gConnecting    = false;
 
+// Live address found by last scan (updated by scanForKeypad)
+static String gLiveKeypadAddr = "";
+static uint8_t gLiveKeypadAddrType = BLE_ADDR_RANDOM;
+
 static uint8_t gLastNonce[8] = {0};
 static bool    gNonceReceived = false;
 
@@ -78,7 +84,7 @@ static bool    gNonceReceived = false;
 
 struct Settings {
   String  wifiSsid, wifiPsk;
-  uint8_t scanSeconds = 5;
+  uint8_t scanSeconds = 4;
   String  mqttHost, mqttUser, mqttPass, mqttTopic;
   uint16_t mqttPort = 1883;
 };
@@ -167,7 +173,7 @@ void loadSettings(){
   prefs.begin("wkpbridge",true);
   settings.wifiSsid    =prefs.getString("wifi_ssid",MYSSID);
   settings.wifiPsk     =prefs.getString("wifi_psk", MYPSK);
-  settings.scanSeconds =prefs.getUChar("scan_sec",5);
+  settings.scanSeconds =prefs.getUChar("scan_sec",4);
   settings.mqttHost =prefs.getString("mqtt_host",""); settings.mqttPort=prefs.getUShort("mqtt_port",1883);
   settings.mqttUser =prefs.getString("mqtt_user",""); settings.mqttPass=prefs.getString("mqtt_pass","");
   settings.mqttTopic=prefs.getString("mqtt_topic","wkpbridge");
@@ -279,10 +285,75 @@ class ClientCB : public NimBLEClientCallbacks {
     addLog(">>> DISCONNECTED reason=0x"+String(reason,HEX)+" dur="+String(dur)+"ms nonce="+String(gNonceReceived?"YES":"NO"));
     gConnected=false; gConnectedAtMs=0; gConnecting=false;
     gNonceReceived=false; txNotifyChr=nullptr; rxWriteChr=nullptr;
+    gLiveKeypadAddr=""; // force rescan next attempt
     gLastConnTryMs=millis();
   }
 };
 ClientCB gClientCB;
+
+// --------------------------------------------------------------------------
+// Scan for keypad -- populate gLiveKeypadAddr with current advertising addr.
+// Identifies by Wyze company ID (0x4459) or name KP-01/DingDing.
+// Returns true if found.
+// --------------------------------------------------------------------------
+bool isWyzeKeypad(const NimBLEAdvertisedDevice *dev){
+  if(dev->haveManufacturerData()){
+    const std::string &m=dev->getManufacturerData();
+    if(m.size()>=2){
+      uint16_t cid=(uint8_t)m[0]|((uint8_t)m[1]<<8);
+      if(cid==WYZE_COMPANY_ID) return true;
+    }
+  }
+  if(dev->haveName()){
+    std::string n=dev->getName();
+    if(n=="KP-01"||n=="DingDing"||n=="Wyze Lock") return true;
+  }
+  return false;
+}
+
+bool scanForKeypad(){
+  addLog("Scanning for keypad ("+String(settings.scanSeconds)+"s)...");
+  NimBLEScan *scan=NimBLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(40);
+  scan->setWindow(40);
+  scan->setDuplicateFilter(false);
+  NimBLEScanResults results=scan->getResults((uint32_t)settings.scanSeconds*1000, false);
+  addLog("Scan done: "+String(results.getCount())+" device(s)");
+
+  // Build scan JSON for UI while we're here
+  String json="["; bool first=true;
+  for(int i=0;i<results.getCount();i++){
+    const NimBLEAdvertisedDevice *dev=results.getDevice(i);
+    NimBLEAddress addr=dev->getAddress();
+    String addrStr=String(addr.toString().c_str()); addrStr.toUpperCase();
+    String name=dev->haveName()?String(dev->getName().c_str()):"";
+    int rssi=dev->getRSSI();
+    String ats=(addr.getType()==BLE_ADDR_RANDOM)?"random":"public";
+    bool wyze=isWyzeKeypad(dev);
+    addLog("  "+addrStr+" ["+ats+"] '"+name+"' rssi="+String(rssi)+(wyze?" [WYZE-KP]":""));
+    if(!first)json+=","; first=false;
+    json+="{\"addr\":\""+jsonEscape(addrStr)+"\",\"addrType\":\""+ats+"\",\"name\":\""+jsonEscape(name)+"\",\"rssi\":"+String(rssi)+",\"wyze\":"+String(wyze?"true":"false")+"}";
+
+    if(wyze && gLiveKeypadAddr.isEmpty()){
+      gLiveKeypadAddr=String(addr.toString().c_str());
+      gLiveKeypadAddrType=addr.getType();
+      addLog("  -> Keypad found: "+gLiveKeypadAddr+" type="+String(gLiveKeypadAddrType));
+    }
+  }
+  json+="]";
+  lastScanJson=json;
+  scan->stop(); scan->clearResults();
+
+  // Fallback: also check hint MAC directly (static address case)
+  if(gLiveKeypadAddr.isEmpty()){
+    addLog("Keypad not found in scan. Will try hint MAC: "+String(KEYPAD_MAC_HINT));
+    gLiveKeypadAddr=String(KEYPAD_MAC_HINT);
+    gLiveKeypadAddrType=BLE_ADDR_RANDOM;
+    return false; // signal: not seen advertising
+  }
+  return true;
+}
 
 // --------------------------------------------------------------------------
 // Connect to keypad
@@ -290,7 +361,15 @@ ClientCB gClientCB;
 bool connectToKeypad(){
   if(gConnected||gConnecting)return gConnected;
   gConnecting=true;
-  addLog("Connecting to keypad "+String(KEYPAD_MAC)+" ...");
+
+  // Always scan first to get the live advertising address
+  bool seen=scanForKeypad();
+  if(!seen){
+    addLog("Keypad not advertising -- skipping connect");
+    gConnecting=false; gLastConnTryMs=millis(); return false;
+  }
+
+  addLog("Connecting to "+gLiveKeypadAddr+" ...");
 
   if(!bleClient){
     bleClient=NimBLEDevice::createClient();
@@ -299,24 +378,23 @@ bool connectToKeypad(){
     bleClient->setConnectTimeout(5);
   }
 
-  NimBLEAddress kpAddr(KEYPAD_MAC, BLE_ADDR_RANDOM);
+  NimBLEAddress kpAddr(gLiveKeypadAddr.c_str(), gLiveKeypadAddrType);
   if(!bleClient->connect(kpAddr)){
     addLog("Connect FAILED");
+    gLiveKeypadAddr=""; // force fresh scan next time
     gConnecting=false; gLastConnTryMs=millis(); return false;
   }
-  // NimBLE 2.x: connect() triggers service/char discovery automatically.
-  // getService() will use cached results.
 
+  // NimBLE 2.x: service discovery happens via getService()
   NimBLERemoteService *nus=bleClient->getService(NUS_SERVICE_UUID);
   if(!nus){
-    addLog("NUS NOT FOUND -- all services:");
-    // NimBLE 2.x getServices() returns a const std::vector by value -- no pointer, no dereference
-    std::vector<NimBLERemoteService*> svcs = bleClient->getServices(true);
+    addLog("NUS NOT FOUND -- services present:");
+    std::vector<NimBLERemoteService*> svcs=bleClient->getServices(true);
     for(NimBLERemoteService *svc : svcs)
-      addLog("  svc: "+String(svc->getUUID().toString().c_str()));
+      addLog("  "+String(svc->getUUID().toString().c_str()));
     bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
   }
-  addLog("NUS service found");
+  addLog("NUS found");
 
   txNotifyChr=nus->getCharacteristic(NUS_TX_UUID);
   rxWriteChr =nus->getCharacteristic(NUS_RX_UUID);
@@ -329,7 +407,7 @@ bool connectToKeypad(){
     bleClient->disconnect(); gConnecting=false; gLastConnTryMs=millis(); return false;
   }
 
-  addLog("Subscribing to keypad TX notify...");
+  addLog("Subscribing to TX notify...");
   bool subOk=txNotifyChr->subscribe(true, onKeypadNotify, false);
   addLog("Subscribe: "+(subOk?String("OK"):String("FAIL")));
   if(!subOk){
@@ -342,32 +420,15 @@ bool connectToKeypad(){
 }
 
 // --------------------------------------------------------------------------
-// Scan (diagnostic)
+// Diagnostic scan (for UI /api/scan endpoint -- does NOT affect connect flow)
 // --------------------------------------------------------------------------
-bool isWyzeDevice(const NimBLEAdvertisedDevice *dev){
-  if(dev->haveManufacturerData()){const std::string &m=dev->getManufacturerData();if(m.size()>=2&&(((uint8_t)m[0]|((uint8_t)m[1]<<8))==WYZE_COMPANY_ID))return true;}
-  if(dev->haveName()){std::string n=dev->getName();if(n=="Wyze Lock"||n=="KP-01"||n=="DingDing")return true;}
-  return false;
-}
-void logDeviceDetail(const NimBLEAdvertisedDevice *dev){
-  if(dev->haveManufacturerData()){
-    const std::string &m=dev->getManufacturerData(); size_t len=m.size();
-    String hex; for(size_t i=0;i<len;i++){const char*h="0123456789ABCDEF";hex+=h[((uint8_t)m[i]>>4)&0xF];hex+=h[(uint8_t)m[i]&0xF];if(i+1<len)hex+=' ';}
-    addLog("    mfr("+String(len)+"b): "+hex);
-    if(len>=8){char ms[18];snprintf(ms,sizeof(ms),"%02X:%02X:%02X:%02X:%02X:%02X",(uint8_t)m[2],(uint8_t)m[3],(uint8_t)m[4],(uint8_t)m[5],(uint8_t)m[6],(uint8_t)m[7]);addLog("    mfrMAC: "+String(ms));}
-    if(len>10){uint8_t dt=(uint8_t)m[10];addLog("    devType=0x"+String(dt,HEX)+(dt==0x07?" KP-01":(dt==0x0A?" Wyze Lock":""))); }
-  }
-  int sc=dev->getServiceUUIDCount();
-  if(sc>0){addLog("    advUUIDs("+String(sc)+"):");for(int i=0;i<sc;i++)addLog("      "+String(dev->getServiceUUID(i).toString().c_str()));}
-  else addLog("    No adv UUIDs");
-}
 String scanJson(){
   if(gConnected){addLog("Scan skipped: connected");return lastScanJson;}
   if(scanRunning){addLog("Scan busy");return lastScanJson;}
   scanRunning=true;
   NimBLEScan *scan=NimBLEDevice::getScan();
   scan->setActiveScan(true);scan->setInterval(40);scan->setWindow(40);scan->setDuplicateFilter(false);
-  addLog("BLE scan "+String(settings.scanSeconds)+"s");
+  addLog("Diag BLE scan "+String(settings.scanSeconds)+"s");
   NimBLEScanResults results=scan->getResults((uint32_t)settings.scanSeconds*1000,false);
   addLog("Scan done: "+String(results.getCount())+" device(s)");
   String json="[";bool first=true;
@@ -378,9 +439,8 @@ String scanJson(){
     String name=dev->haveName()?String(dev->getName().c_str()):"";
     int rssi=dev->getRSSI();
     String ats=(addr.getType()==BLE_ADDR_RANDOM)?"random":"public";
-    bool wyze=isWyzeDevice(dev);
-    addLog("  "+addrStr+" ["+ats+"] '"+name+"' rssi="+String(rssi)+(wyze?" [Wyze]":""));
-    logDeviceDetail(dev);
+    bool wyze=isWyzeKeypad(dev);
+    addLog("  "+addrStr+" ["+ats+"] '"+name+"' rssi="+String(rssi)+(wyze?" [WYZE]":""));
     if(!first)json+=",";first=false;
     json+="{\"addr\":\""+jsonEscape(addrStr)+"\",\"addrType\":\""+ats+"\",\"name\":\""+jsonEscape(name)+"\",\"rssi\":"+String(rssi)+",\"wyze\":"+String(wyze?"true":"false")+"}";
   }
@@ -419,6 +479,7 @@ String makeStateJson(){
   String ip=WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"";
   String apIp=portalMode?WiFi.softAPIP().toString():"";
   unsigned long tsc=(gConnected&&gConnectedAtMs)?(millis()-gConnectedAtMs):0;
+  String liveAddr=gLiveKeypadAddr.isEmpty()?String(KEYPAD_MAC_HINT):gLiveKeypadAddr;
   json+="{";
   json+="\"hostname\":\""+String(HOSTNAME)+"\",";
   json+="\"wifiConnected\":"+String(WiFi.status()==WL_CONNECTED?"true":"false")+",";
@@ -429,7 +490,7 @@ String makeStateJson(){
   json+="\"rssi\":"+String(WiFi.status()==WL_CONNECTED?WiFi.RSSI():0)+",";
   json+="\"bleMode\":\"central\",";
   json+="\"bleConnected\":"+String(gConnected?"true":"false")+",";
-  json+="\"keypadMac\":\""+String(KEYPAD_MAC)+"\",";
+  json+="\"keypadMac\":\""+jsonEscape(liveAddr)+"\",";
   json+="\"tSinceConnMs\":"+String(tsc)+",";
   json+="\"ownBleAddr\":\""+String(NimBLEDevice::getAddress().toString().c_str())+"\",";
   json+="\"nonceReceived\":"+String(gNonceReceived?"true":"false")+",";
@@ -534,17 +595,18 @@ void serviceWiFi(){
 }
 void serviceBLE(){
   if(gConnected||gConnecting||scanRunning)return;
-  if(millis()-gLastConnTryMs>5000){
+  // Retry every 15s (scan takes ~4s itself, no need to hammer)
+  if(millis()-gLastConnTryMs>15000){
     gLastConnTryMs=millis();
     connectToKeypad();
   }
 }
 void setup(){
-  DBG_BEGIN(115200);delay(200);addLog("Boot r10i");
+  DBG_BEGIN(115200);delay(200);addLog("Boot r10j");
   loadSettings();
   addLog("AES key: "+bytesToHex(AES_KEY,16));
-  addLog("Keypad MAC (target): "+String(KEYPAD_MAC));
-  addLog("r10i: CENTRAL -- connecting TO keypad");
+  addLog("Keypad hint MAC: "+String(KEYPAD_MAC_HINT));
+  addLog("r10j: scan-first connect (handles rotating random addr)");
   addLog("UART1 sniffer: RX=GPIO"+String(UART1_RX_PIN)+" TX=GPIO"+String(UART1_TX_PIN));
   WiFi.disconnect(true,true);delay(200);
   beginWiFi(false);
@@ -559,7 +621,7 @@ void setup(){
   while(WiFi.status()!=WL_CONNECTED&&millis()-t0<12000){delay(100);server.handleClient();}
   if(WiFi.status()!=WL_CONNECTED){addLog("WiFi timeout -> portal");startPortal();}
   else ensureMDNSOTA();
-  addLog("Will auto-connect to keypad in 5s...");
+  addLog("Will scan + connect to keypad in 15s...");
 }
 void loop(){
   server.handleClient();

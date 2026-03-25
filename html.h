@@ -21,10 +21,16 @@ input,select{background:#333;color:#e0e0e0;border:1px solid #555;padding:4px 6px
 .term{background:#000;border:1px solid #0a0;padding:6px;height:240px;overflow-y:auto;white-space:pre;font-size:11px;color:#0f0;border-radius:4px;font-family:'Courier New',monospace}
 .status{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px}
 .on{background:#1a4a1a;color:#4f4}.off{background:#4a1a1a;color:#f44}
+.hl{background:#2a3a1a;color:#af4}
 label{color:#aaa;font-size:11px}
+table{width:100%;border-collapse:collapse;font-size:11px;margin-top:6px}
+th{background:#1e1e2e;color:#8af;padding:3px 6px;text-align:left;border-bottom:1px solid #333}
+td{padding:3px 6px;border-bottom:1px solid #222}
+tr:hover td{background:#2a2a3a}
+.wyze td{color:#4f4}
 </style>
 </head><body>
-<h2>WKPbridge <span id='ver' style='font-size:11px;color:#888'>r10h</span></h2>
+<h2>WKPbridge <span id='ver' style='font-size:11px;color:#888'>r10j</span></h2>
 
 <div class='card'>
   <h2>Status</h2>
@@ -55,6 +61,17 @@ label{color:#aaa;font-size:11px}
     <input id='rawHex' size='30' placeholder='DE C0 AD DE FF...'>
     <button onclick='sendRaw()'>Send Raw</button>
   </div>
+</div>
+
+<div class='card'>
+  <h2>BLE Scan
+    <button style='float:right;font-size:10px' onclick='doScan()'>Scan Now</button>
+  </h2>
+  <div id='scanStatus' style='font-size:11px;color:#888;margin-bottom:4px'>No scan yet</div>
+  <table id='scanTable'>
+    <thead><tr><th>Address</th><th>Type</th><th>Name</th><th>RSSI</th><th>Wyze</th></tr></thead>
+    <tbody id='scanBody'></tbody>
+  </table>
 </div>
 
 <div class='card'>
@@ -100,8 +117,10 @@ label{color:#aaa;font-size:11px}
     <button onclick='saveWifi()'>Save WiFi</button>
   </div>
   <div class='row' style='margin-top:4px'>
+    <label>Scan secs:</label>
+    <input id='scanSec' size='3' value='4'>
+    <button onclick='saveConfig()'>Save Config</button>
     <button onclick='post("/api/reboot")' class='red'>Reboot</button>
-    <button onclick='doScan()'>BLE Scan</button>
   </div>
 </div>
 
@@ -128,11 +147,32 @@ function appendTerm(s){
 
 function sendRaw(){post('/api/sendRaw','hex='+encodeURIComponent(document.getElementById('rawHex').value));}
 function saveWifi(){post('/api/saveWifi','ssid='+encodeURIComponent(document.getElementById('ssid').value)+'&psk='+encodeURIComponent(document.getElementById('psk').value));}
-function doScan(){
-  appendLog('Starting scan...');
-  fetch('/api/scan').then(r=>r.json()).then(d=>{
-    appendLog('Scan: '+JSON.stringify(d));
+function saveConfig(){
+  const s=document.getElementById('scanSec').value;
+  post('/api/saveConfig','scanSeconds='+encodeURIComponent(s));
+}
+
+function renderScan(data){
+  const tbody=document.getElementById('scanBody');
+  const st=document.getElementById('scanStatus');
+  tbody.innerHTML='';
+  if(!data||!data.length){st.textContent='No devices found';return;}
+  st.textContent=data.length+' device(s)';
+  data.forEach(d=>{
+    const tr=document.createElement('tr');
+    if(d.wyze)tr.className='wyze';
+    tr.innerHTML='<td>'+d.addr+'</td><td>'+d.addrType+'</td><td>'+(d.name||'')+'</td><td>'+d.rssi+'</td><td>'+(d.wyze?'&#x2714;':'')+'</td>';
+    tbody.appendChild(tr);
   });
+}
+
+function doScan(){
+  document.getElementById('scanStatus').textContent='Scanning...';
+  document.getElementById('scanBody').innerHTML='';
+  fetch('/api/scan').then(r=>r.json()).then(d=>{
+    renderScan(d);
+    appendLog('Scan complete: '+d.length+' device(s)');
+  }).catch(e=>appendLog('Scan error: '+e));
 }
 
 // UART1
@@ -156,7 +196,6 @@ function serialSendHex(){
   post('/api/serial/write','hex='+encodeURIComponent(h));
 }
 
-let lastPollData='';
 function pollSerial(){
   fetch('/api/serial/read').then(r=>r.json()).then(d=>{
     if(d.data&&d.data.length>0) appendTerm(d.data);
@@ -179,14 +218,15 @@ function refreshState(){
     if(d.lastTx)sl+='TX: '+d.lastTx+'  ';
     if(d.lastRx)sl+='RX: '+d.lastRx;
     document.getElementById('statusLine').textContent=sl||'--';
-    // update log
     if(d.logs){
       log.textContent=d.logs;
       if(autoScroll)log.scrollTop=log.scrollHeight;
     }
-    // pre-fill ssid
     if(!document.getElementById('ssid').value&&d.ssid)
       document.getElementById('ssid').value=d.ssid;
+    // update scan table if data present from auto-connect scan
+    if(d.scan&&d.scan.length>2&&document.getElementById('scanBody').childElementCount===0)
+      renderScan(JSON.parse(d.scan));
   }).catch(()=>{});
 }
 
