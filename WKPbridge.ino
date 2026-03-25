@@ -203,7 +203,7 @@ void beginWiFi(bool keepAp){
   if(settings.wifiPsk.isEmpty()) settings.wifiPsk =MYPSK;
   addLog("WiFi SSID="+settings.wifiSsid);
   WiFi.begin(settings.wifiSsid.c_str(),settings.wifiPsk.c_str());
-  WiFi.setTxPower(WIFI_POWER_15dBm); lastWifiTryMs=millis();
+  WiFi.setTxPower(WIFI_POWER_11dBm); lastWifiTryMs=millis();
 }
 void ensureMDNSOTA(){
   if(WiFi.status()!=WL_CONNECTED)return;
